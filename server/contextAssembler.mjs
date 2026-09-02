@@ -5,6 +5,7 @@ import {
 } from './contextStore.mjs';
 import { oneShot } from './claudeSession.mjs';
 import { skillMeta } from './skillsRegistry.mjs';
+import { inlineBinaryText, PDF_INLINE_LIMIT } from './fileExtract.mjs';
 
 // 上下文装配器：批改/提问前，把篮子里"启用"的源汇总成一段上下文文本，
 // 并决定这个会话的安全档位 kind：'write'（默认，禁 Bash/网络）或 'api'（有 live API 源→放行网关只读 client）。
@@ -93,10 +94,24 @@ export function assemble(name, { agentic = true, kbTool = false } = {}) {
         parts.push(`${head}\n路径：\`${s.path}\`${r.truncated ? '（已截断）' : ''}\n\`\`\`\n${r.text}\n\`\`\``);
         used.push({ id: s.id, label: isL3 ? `L3·${s.label}` : s.label, mode: 'snapshot', type: 'file' });
       } else if (r.binary) {
-        // 二进制/PDF：给路径让 claude 自己 Read（原生支持 PDF）
-        parts.push(`### 挂载文件：${s.label}\n二进制/PDF，请用 Read 工具读取：\`${s.path}\``);
-        used.push({ id: s.id, label: s.label, mode: 'snapshot(read-on-demand)', type: 'file' });
-        if (!path.isAbsolute(s.path)) { /* noop */ }
+        // 二进制：先让可信 node 后端抽文本 inline（PDF）。
+        // 之前这里只给一句"请用 Read 工具读取"——对 deepseek 等无工具模型等于没给，
+        // 用户实测就是"读不了上下文里的 PDF"。抽取在后端做，不给任何 claude 档加 Bash。
+        const ex = inlineBinaryText(s.path);
+        if (ex.text) {
+          const tail = ex.truncated
+            ? `\n（⚠️ 全文共 ${ex.fullChars} 字符，已截断到 ${PDF_INLINE_LIMIT}${agentic ? `；余下请用 Read 工具读原件 \`${s.path}\`` : '；余下内容当前模型看不到，涉及处标 🟡 待核'}）`
+            : '';
+          parts.push(`### 挂载文件（PDF · 服务端已抽成文本 snapshot）：${s.label}\n路径：\`${s.path}\`（抽取器 ${ex.via}，${ex.fullChars} 字符）\n\`\`\`\n${ex.text}\n\`\`\`${tail}`);
+          used.push({ id: s.id, label: s.label, mode: ex.truncated ? 'snapshot(PDF文本·已截断)' : 'snapshot(PDF文本)', type: 'file' });
+        } else if (agentic) {
+          // 抽不出（扫描件/非 PDF 二进制）：claude 原生能 Read PDF，退回给路径
+          parts.push(`### 挂载文件：${s.label}\n二进制/PDF，服务端未能抽出文本（${ex.error || '不支持的格式'}），请用 Read 工具读取：\`${s.path}\``);
+          used.push({ id: s.id, label: s.label, mode: 'snapshot(read-on-demand)', type: 'file' });
+        } else {
+          parts.push(`### 挂载文件：${s.label}\n二进制文件，服务端未能抽出文本（${ex.error || '不支持的格式'}）；当前模型无工具读不了它——涉及这份文件的内容一律标 🟡 待核，不要猜。`);
+          used.push({ id: s.id, label: s.label, mode: 'binary(不可读)', type: 'file' });
+        }
       } else {
         parts.push(`### 挂载文件：${s.label}\n（读取失败：${r.error || '未知'}，本次跳过）`);
       }

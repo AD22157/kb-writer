@@ -36,12 +36,32 @@ select, input { font: inherit; padding: 4px 7px; border: 1px solid var(--line); 
 .ProseMirror h1 { font-size: 1.7em; } .ProseMirror h2 { font-size: 1.35em; }
 .ProseMirror p { margin: .6em 0; }
 .ProseMirror ::selection { background: rgba(108,199,154,.35); }
+/* 失焦保留的选区（KeepSelection 插件加的 decoration）：编辑器失焦后原生高亮会消失，用这层顶上 */
+.ProseMirror .sel-kept { background: rgba(108,199,154,.30); box-shadow: 0 0 0 1px rgba(10,125,84,.30); border-radius: 2px; }
+
+/* 理解层（L3）模式：醒目区分——琥珀色横幅 + 编辑区描边 */
+.left.l3mode { border-left: 4px solid #b9770e; background: rgba(185, 119, 14, .04); }
+.l3banner { border: 1px solid #b9770e; border-radius: 9px; padding: 9px 13px; margin-bottom: 14px; background: rgba(185, 119, 14, .10); }
+.l3title { font-size: 14.5px; color: #8a5a0a; }
+@media (prefers-color-scheme: dark) { .l3title { color: #e0aa4e; } }
+.l3sub { font-size: 12.5px; color: var(--muted); margin-top: 3px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.l3level { display: inline-flex; align-items: center; gap: 4px; }
+.l3level input { width: 3em; text-align: center; padding: 1px 4px; border-color: #b9770e; }
+.l3note { border: 1px dashed #b9770e; border-radius: 9px; padding: 10px 13px; margin-bottom: 10px; color: var(--muted); font-size: 13px; background: rgba(185, 119, 14, .06); }
 
 .actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
 .sel-actions { display: inline-flex; gap: 6px; opacity: .5; }
 .sel-actions[data-active="true"] { opacity: 1; }
 .ask-row { display: flex; gap: 6px; margin-bottom: 8px; }
 .ask-row input { flex: 1; }
+
+/* 选区回显：让用户点到右侧面板前后都能确认"选的是哪段" */
+.selpreview { font-size: 12.5px; color: var(--muted); margin: 0 0 8px; padding: 5px 9px; border-radius: 7px;
+  border: 1px dashed var(--line); background: var(--bg); }
+.selpreview.on { color: var(--ink); border-style: solid; border-color: var(--accent); background: rgba(108,199,154,.10); }
+.selpreview .selquote { color: var(--accent); }
+.modelnote { font-size: 12.5px; line-height: 1.6; color: var(--muted); margin: 0 0 8px; padding: 7px 10px;
+  border-radius: 7px; border: 1px dashed var(--accent2); background: rgba(44,110,143,.07); }
 
 .trace { font-size: 12px; color: var(--muted); margin: 6px 0; }
 .chip { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 10px; background: var(--line); color: var(--ink); margin: 0 3px 3px 0; }

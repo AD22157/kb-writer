@@ -5,7 +5,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CONFIG } from './config.mjs';
-import { ensureNas, listDrafts, readDraft, writeDraft, publishFeedback, listVersions, readVersion, restoreVersion } from './kbStore.mjs';
+import {
+  ensureNas, listDrafts, readDraft, writeDraft, publishFeedback, listVersions, readVersion, restoreVersion,
+  listDimensions, readDimension, writeDimension,
+} from './kbStore.mjs';
 import { getSession, shutdownAll } from './claudeSession.mjs';
 import { assemble, snapshotApiSource } from './contextAssembler.mjs';
 import {
@@ -19,6 +22,7 @@ import { buildNonAgenticSystemPrompt } from './systemPrompt.mjs';
 import { ensureActionFiles, loadActionBody, readActionSkill, writeActionSkill, ACTION_FILES } from './actionSkills.mjs';
 import { installedSkills } from './skillsRegistry.mjs';
 import { setSkills } from './contextStore.mjs';
+import { extractPdfText, isPdfPath } from './fileExtract.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 ensureActionFiles();   // 把 补充/修正/提问/起草 的内置方法论迁成可编辑文件（已存在则不动）
@@ -113,25 +117,39 @@ app.put('/api/draft', (req, res) => {
   res.json({ ok: true, ...writeDraft(name, markdown) });
 });
 
+// 理解层（L3）会话提示：agent 可协助，但只能提议；写 dimensions 的唯一通道是「人在 UI 上确认落笔 → PUT /api/dimension」。
+// （agent 进程侧还有 api 档沙箱 denyWrite 兜底，它根本写不进 kb/dimensions。）
+const L3_NOTE = `\n\n【注意：这是一份 kb/dimensions/ 的**理解层（L3）维度文件**，不是普通草稿。】\n` +
+  `L3 是主人裁定过的理解正文。你可以协助（核查、补论据、指出逻辑问题、按要求起草片段），但你的产出一律是**提议**：\n` +
+  `主人在写作台点「确认落笔」才会进正文，你自己没有任何写 dimensions 的权限。\n` +
+  `因此：① 别写"我已更新"这类话；② 建议改动时用 \`【建议修订】\`/\`【建议插入】\` 单独起段给可直接使用的纯文本；\n` +
+  `③ 顺带提醒主人改完在文末补一条带日期的校准日志。\n`;
+const isDim = (docType) => docType === 'dim';
+// dim 文档不落 kb/writing（L3 只走 PUT /api/dimension，前端已自动存）
+const persistIfDraft = (docType, name, markdown) => {
+  if (isDim(docType) || typeof markdown !== 'string') return;
+  try { writeDraft(name, markdown); } catch { /* 存盘失败不阻断 */ }
+};
+
 // ---- 批改（整篇） ----
 app.post('/api/review', async (req, res) => {
-  const { name, markdown, model, quick } = req.body || {};
+  const { name, markdown, model, quick, docType } = req.body || {};
   if (!name || typeof markdown !== 'string') return res.status(400).json({ error: '缺少 name/markdown' });
   if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
-  try { writeDraft(name, markdown); } catch { /* 存盘失败不阻断 */ }
-  await runTurn(res, { name, model, buildPrompt: (ctx) => reviewPrompt(name, markdown, quick, ctx) });
+  persistIfDraft(docType, name, markdown);
+  await runTurn(res, { name, model, buildPrompt: (ctx) => reviewPrompt(name, markdown, quick, ctx) + (isDim(docType) ? L3_NOTE : '') });
 });
 
 // ---- 一起写（选段级动作） ----
 app.post('/api/act', async (req, res) => {
-  const { name, action, selection, question, outline, markdown, model } = req.body || {};
+  const { name, action, selection, question, outline, markdown, model, docType } = req.body || {};
   const ACTIONS = ['ask', 'supplement', 'revise', 'question', 'draft', 'audit'];
   if (!name || !ACTIONS.includes(action)) return res.status(400).json({ error: 'action 须为 ' + ACTIONS.join('/') });
   if (action === 'ask' && !question) return res.status(400).json({ error: 'ask 需要 question' });
   if (['audit', 'revise', 'supplement'].includes(action) && !selection) return res.status(400).json({ error: action + ' 需要 selection' });
   if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
-  if (typeof markdown === 'string') { try { writeDraft(name, markdown); } catch { /* noop */ } }
-  await runTurn(res, { name, model, buildPrompt: (ctx) => actPrompt(action, { name, selection, question, outline, md: markdown }, ctx) });
+  persistIfDraft(docType, name, markdown);
+  await runTurn(res, { name, model, buildPrompt: (ctx) => actPrompt(action, { name, selection, question, outline, md: markdown }, ctx) + (isDim(docType) ? L3_NOTE : '') });
 });
 
 // ---- 上下文篮子 ----
@@ -218,7 +236,14 @@ app.post('/api/context/upload', express.raw({ type: '*/*', limit: '40mb' }), (re
   if (!Buffer.isBuffer(req.body) || req.body.length === 0) return res.status(400).json({ error: '空文件' });
   if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
   const saved = saveAttachment(name, filename, req.body);
-  const basket = addSource(name, { type: 'file', path: saved.path, label: `${saved.name}（上传 ${(saved.bytes / 1024).toFixed(0)}KB）`, mode: 'snapshot' });
+  // PDF：上传时就在后端抽一次文本并落缓存（之后每次批改读缓存，不重抽）。
+  // 抽取结果写进 label，用户在上下文抽屉里一眼看得到"这份 PDF 到底进没进上下文"。
+  let extractNote = '';
+  if (isPdfPath(saved.path)) {
+    const ex = extractPdfText(saved.path);
+    extractNote = ex.text ? ` · 已抽文本 ${(ex.chars / 1000).toFixed(1)}K字` : ` · ⚠️ 抽不出文本（${ex.error}）`;
+  }
+  const basket = addSource(name, { type: 'file', path: saved.path, label: `${saved.name}（上传 ${(saved.bytes / 1024).toFixed(0)}KB${extractNote}）`, mode: 'snapshot' });
   res.json({ ok: true, ...saved, basket });
 });
 
@@ -239,26 +264,51 @@ app.post('/api/context/snapshot', async (req, res) => {
   }
 });
 
+// ---- 理解层（kb/dimensions，L3 主人手写区）----
+// 唯一可写 dimensions 的机器路径 = 下面这条 PUT（用户经 UI 主动保存 = 人改 L3，合规）：
+// token 鉴权（全局 requireToken）+ 路径守卫（不含分隔符/..，writeDimension 内再兜）+ 原子写。
+// claude/deepseek 会话沙箱 allowWrite 仍只 kb/writing，一字未动。
+app.get('/api/dimensions', (req, res) => {
+  if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
+  res.json({ dimensions: listDimensions() });
+});
+app.get('/api/dimension', (req, res) => {
+  const name = (req.query.name || '').toString();
+  if (!name) return res.status(400).json({ error: '缺少 name' });
+  if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
+  res.json(readDimension(name));
+});
+app.put('/api/dimension', (req, res) => {
+  const { name, markdown } = req.body || {};
+  if (!name || typeof markdown !== 'string') return res.status(400).json({ error: '缺少 name/markdown' });
+  if (/[/\\]/.test(name) || name.includes('..')) return res.status(400).json({ error: 'name 不能含路径分隔符' });
+  if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
+  try { res.json({ ok: true, ...writeDimension(name, markdown) }); }
+  catch (e) { res.status(400).json({ error: String(e.message || e) }); }
+});
+
 // ---- 版本历史（NAS 回收站每次自动存的历史版本；只读+恢复成新文件，不覆盖当前）----
+// scope=writing（默认，草稿）| dimensions（理解层——L3 必须能回退）
+const versionScope = (v) => (v === 'dimensions' ? 'dimensions' : 'writing');
 app.get('/api/versions', (req, res) => {
   const name = (req.query.name || '').toString();
   if (!name) return res.status(400).json({ error: '缺少 name' });
   if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
-  res.json(listVersions(name));
+  res.json(listVersions(name, versionScope(req.query.scope)));
 });
 app.get('/api/version', (req, res) => {
   const file = (req.query.file || '').toString();
   if (!file) return res.status(400).json({ error: '缺少 file' });
   if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
-  const content = readVersion(file);
+  const content = readVersion(file, versionScope(req.query.scope));
   if (content == null) return res.status(404).json({ error: '找不到该版本' });
   res.json({ file, content });
 });
 app.post('/api/version/restore', (req, res) => {
-  const { name, file } = req.body || {};
+  const { name, file, scope } = req.body || {};
   if (!name || !file) return res.status(400).json({ error: '缺少 name/file' });
   if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
-  try { res.json({ ok: true, ...restoreVersion(name, file) }); }
+  try { res.json({ ok: true, ...restoreVersion(name, file, versionScope(scope)) }); }
   catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 

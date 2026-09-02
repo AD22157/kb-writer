@@ -77,19 +77,61 @@ export function writeDraft(name, markdown) {
   return { name, path: dest };
 }
 
-// ---- 版本历史（NAS 群晖回收站，每次自动存都留了一版）----
-// 回收站在 share 根 `#recycle`，镜像原路径：/Volumes/2026Projects/#recycle/kb/writing/
-// 文件名形如 <草稿>_<HHMMSS>.md（群晖追加时间戳）；mtime 保留了真实保存时刻。
-const RECYCLE_WRITING = path.join(CONFIG.KB_ROOT, '..', '#recycle', 'kb', 'writing');
+// ---- 理解层（kb/dimensions/*.md，L3 主人手写区）----
+// 宪法：L3 是主人手写区，人随时可改，但 agent 不能代笔。**唯一可写机器路径 = 服务端这几个
+// 「用户经 UI 主动保存」的函数**（token 鉴权在路由层）；claude/deepseek 会话的沙箱
+// allowWrite 仍只 kb/writing，一字未动——机器会话依然写不了 dimensions。
 
-function recycleDir() {
-  // KB_ROOT = /Volumes/2026Projects/kb → 回收站 /Volumes/2026Projects/#recycle/kb/writing
-  const share = path.dirname(CONFIG.KB_ROOT);           // /Volumes/2026Projects
-  return path.join(share, '#recycle', 'kb', 'writing');
+const DIMS_DIR = path.join(CONFIG.KB_ROOT, 'dimensions');
+
+function resolveDimOnDisk(baseName) {
+  const want = nfc(baseName);
+  if (!fs.existsSync(DIMS_DIR)) return null;
+  for (const fn of fs.readdirSync(DIMS_DIR)) if (nfc(fn) === want) return fn;
+  return null;
 }
 
-export function listVersions(name) {
-  const dir = recycleDir();
+export function listDimensions() {
+  if (!fs.existsSync(DIMS_DIR)) return [];
+  return fs.readdirSync(DIMS_DIR)
+    .filter((fn) => nfc(fn).endsWith('.md'))
+    .map((fn) => {
+      const st = fs.statSync(path.join(DIMS_DIR, fn));
+      return { name: nfc(fn).slice(0, -3), mtime: st.mtimeMs, size: st.size };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+}
+
+export function readDimension(name) {
+  const on = resolveDimOnDisk(`${name}.md`);
+  return { name, markdown: on ? fs.readFileSync(path.join(DIMS_DIR, on), 'utf8') : '', exists: !!on };
+}
+
+// 路径守卫（路由层校验过，这里再兜一层）+ 原子写（tmp+rename）。复用磁盘既有 NFD 文件名避免双写。
+export function writeDimension(name, markdown) {
+  if (/[/\\]/.test(name) || name.includes('..') || !name.trim()) throw new Error('非法维度名');
+  if (!fs.existsSync(DIMS_DIR)) throw new Error('kb/dimensions 目录不存在（NAS 状态异常，拒绝写）');
+  const on = resolveDimOnDisk(`${name}.md`) || `${name}.md`;
+  const dest = path.join(DIMS_DIR, on);
+  if (path.dirname(dest) !== DIMS_DIR) throw new Error('路径越界，拒绝写');   // 双保险：写只允许落在 dimensions/ 平级
+  const tmp = `${dest}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, markdown, 'utf8');
+  fs.renameSync(tmp, dest);
+  return { name, path: dest };
+}
+
+// ---- 版本历史（NAS 群晖回收站，每次自动存都留了一版）----
+// 回收站在 share 根 `#recycle`，镜像原路径：/Volumes/2026Projects/#recycle/kb/{writing,dimensions}/
+// 文件名形如 <名>_<HHMMSS>.md（群晖追加时间戳）；mtime 保留了真实保存时刻。
+// scope：'writing'（草稿）| 'dimensions'（理解层——L3 是最贵的资产，必须能回退）。
+
+function recycleDir(scope = 'writing') {
+  const share = path.dirname(CONFIG.KB_ROOT);           // /Volumes/2026Projects
+  return path.join(share, '#recycle', 'kb', scope === 'dimensions' ? 'dimensions' : 'writing');
+}
+
+export function listVersions(name, scope = 'writing') {
+  const dir = recycleDir(scope);
   if (!fs.existsSync(dir)) return { available: false, versions: [] };
   const want = nfc(name);
   const out = [];
@@ -106,23 +148,25 @@ export function listVersions(name) {
   return { available: true, versions: out };
 }
 
-export function readVersion(file) {
+export function readVersion(file, scope = 'writing') {
   // 只允许读回收站目录里的裸文件名（防路径穿越）
   if (/[/\\]/.test(file)) return null;
-  const dir = recycleDir();
+  const dir = recycleDir(scope);
   const on = fs.readdirSync(dir).find((f) => nfc(f) === nfc(file));
   if (!on) return null;
   try { return fs.readFileSync(path.join(dir, on), 'utf8'); } catch { return null; }
 }
 
-// 恢复：把某个历史版本写成一个**新草稿**（不覆盖当前），返回新名字。
-export function restoreVersion(name, file) {
-  const content = readVersion(file);
+// 恢复：把某个历史版本写成一个**新文件**（不覆盖当前），返回新名字。
+// dimensions scope 恢复也落回 kb/dimensions/（同为用户经 UI 主动操作，走同一守卫的写函数）。
+export function restoreVersion(name, file, scope = 'writing') {
+  const content = readVersion(file, scope);
   if (content == null) throw new Error('找不到该版本');
   const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '');
   const newName = `${name}-恢复${stamp}`;
-  writeDraft(newName, content);
-  return { name: newName };
+  if (scope === 'dimensions') writeDimension(newName, content);
+  else writeDraft(newName, content);
+  return { name: newName, scope };
 }
 
 // 写 <草稿>.反馈.md 并调用 QS-写作 的 render_feedback.py（内部走唯一发布器 publish-kb-html.py）。

@@ -10,6 +10,15 @@ const MODELS = [
   { id: 'deepseek-chat', label: 'DeepSeek（省额度·调研走后端工具循环）' },
 ];
 
+// deepseek 是纯补全、无工具（与后端 providers.isAgentic 同口径）
+const isAgenticModel = (m: string) => !String(m).startsWith('deepseek');
+
+// 选区回显：压平空白，长选区留首尾两截，让用户两头都能对上是不是那段
+function selPreview(s: string): string {
+  const one = s.replace(/\s+/g, ' ').trim();
+  return one.length <= 40 ? one : `${one.slice(0, 26)}…${one.slice(-12)}`;
+}
+
 // 从流式反馈里抽出可落笔的候选（提议→确认落笔）
 function extractCandidate(md: string): { mode: 'replace' | 'insert'; text: string } | null {
   const markers: [RegExp, 'replace' | 'insert'][] = [
@@ -66,6 +75,15 @@ export default function App() {
   const [versions, setVersions] = useState<API.Version[] | null>(null);
   const [versionsErr, setVersionsErr] = useState('');
   const [versionPreview, setVersionPreview] = useState<{ file: string; content: string } | null>(null);
+  // 理解层（kb/dimensions，L3 主人手写区）：同一编辑器编辑，醒目区分；agent 动作在此模式停用
+  const [docType, setDocType] = useState<'draft' | 'dim'>('draft');
+  const docTypeRef = useRef<'draft' | 'dim'>('draft');
+  const [dims, setDims] = useState<API.Dimension[] | null>(null);
+  const [showDims, setShowDims] = useState(false);
+  const [dimLevel, setDimLevel] = useState('');        // frontmatter 理解等级 的可编辑显示
+  const dimFmRef = useRef('');                          // 维度文件 frontmatter 原文（不进 Tiptap，防 YAML 被 markdown 往返改坏）
+  const dimBaselineRef = useRef('');                    // 打开时的服务器全文（校准日志检测基线）
+  const calibPromptedRef = useRef(false);               // 校准轻提示每次打开只弹一次
   // 实体挂载（公司/人/产品 = L2 事实页；维度 = L3 只读）
   const [showEntities, setShowEntities] = useState(false);
   const [entType, setEntType] = useState<'公司' | '人' | '产品' | '维度L3'>('公司');
@@ -78,6 +96,7 @@ export default function App() {
   const mountedSkills = basket.skills || [];
 
   const loadingRef = useRef(false);
+  const agentsRef = useRef<HTMLDivElement>(null);   // 多 agent 面板（在 .right 滚动容器最底部，见下方 effect）
   const saveTimer = useRef<number | undefined>(undefined);
   const autoTimer = useRef<number | undefined>(undefined);
   const mdRef = useRef('');
@@ -85,7 +104,14 @@ export default function App() {
   const dirtyRef = useRef(false);        // beforeunload 闭包用
 
   // ---- 本地恢复缓冲（localStorage）：即使没点保存、后退/崩溃/刷新也不丢 ----
-  const localKey = (n: string) => `kbw-draft:${n}`;
+  // 草稿与维度分前缀（同名不串）；维度缓冲存的是「frontmatter+正文」全文
+  const localKey = (n: string) => `${docTypeRef.current === 'dim' ? 'kbw-dim' : 'kbw-draft'}:${n}`;
+  // 维度文件的 frontmatter 拆分：YAML 不进编辑器（Tiptap markdown 往返会把 `#` 注释当标题改坏），保存时原样拼回
+  const splitFm = (md: string): { fm: string; body: string } => {
+    const m = md.match(/^---\n[\s\S]*?\n---\n?/);
+    return m ? { fm: m[0], body: md.slice(m[0].length) } : { fm: '', body: md };
+  };
+  const fullDimMd = (body: string) => dimFmRef.current + body;
   const writeLocal = (n: string, md: string) => { try { localStorage.setItem(localKey(n), JSON.stringify({ markdown: md, ts: Date.now() })); } catch { /* 满了忽略 */ } };
   const readLocal = (n: string): { markdown: string; ts: number } | null => { try { const s = localStorage.getItem(localKey(n)); return s ? JSON.parse(s) : null; } catch { return null; } };
   const setSave = (s: 'saved' | 'dirty' | 'saving') => { setSaveState(s); dirtyRef.current = (s !== 'saved'); };
@@ -114,6 +140,16 @@ export default function App() {
     return () => window.removeEventListener('beforeunload', onBeforeUnload);
   }, []);
 
+  // 多 agent 面板排在 .right 滚动容器的最底部（批改反馈 .feedback 之后）。
+  // 批改/批注一次后反馈有上千 px，面板被顶出视口，而切 showAgents 不动 scrollTop
+  // → 用户点「多 agent 助手」看起来"什么都没发生"（实测：批改前 top=170px 可见，批改后 top=1580px 视口外）。
+  // 修：开面板时把它滚进视野。
+  useEffect(() => {
+    if (!showAgents) return;
+    const t = window.setTimeout(() => agentsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
+    return () => window.clearTimeout(t);
+  }, [showAgents]);
+
   // 有任务在跑时每秒刷新一次，驱动"已用 Ns"进度
   const anyRunning = Object.values(runs).some((r) => r.status === 'running');
   useEffect(() => {
@@ -127,6 +163,7 @@ export default function App() {
     if (!n) return;
     const d = await API.loadDraft(n);
     loadingRef.current = true;
+    setDocType('draft'); docTypeRef.current = 'draft';
     setName(n); nameRef.current = n;
     let md = d.markdown || '';
     // 本地恢复：若 localStorage 有一份与服务器不同的未保存编辑 → 提示恢复
@@ -149,7 +186,7 @@ export default function App() {
     writeLocal(n, md);
     setBasket(d.basket || { version: 1, sources: [] });
     setPanelMd(d.feedback ? `> 已有旁批 \`${n}.反馈.md\`（下方为历史反馈）\n\n${d.feedback}` : '');
-    setUsed([]); setToolsSeen([]); setStatusLine(''); setPublishUrl(''); setErrorMsg('');
+    setUsed([]); setToolsSeen([]); setStatusLine(''); setPublishUrl(''); setErrorMsg(''); setPendingInsert('');
     setSave('saved'); setSavedAt(Date.now());
     setTimeout(() => { loadingRef.current = false; }, 200);
   };
@@ -162,20 +199,95 @@ export default function App() {
     openDraft(n);
   };
 
-  // 立即 flush 到 NAS（保存按钮 / 失焦 / beforeunload 前调用）
-  const saveNow = async () => {
+  // ---- 理解层（L3）打开：同一编辑器；frontmatter 不进编辑器、保存时原样拼回 ----
+  const openDims = async () => {
+    setShowDims(true);
+    try { setDims(await API.listDimensions()); } catch (e: any) { setErrorMsg('读理解层清单失败：' + (e.message || e)); setDims([]); }
+  };
+  const openDimension = async (n: string, presetFull?: string) => {
+    if (!n) return;
+    let full: string;
+    if (presetFull != null) full = presetFull;
+    else {
+      const d = await API.loadDimension(n);
+      full = d.markdown || '';
+    }
+    loadingRef.current = true;
+    setDocType('dim'); docTypeRef.current = 'dim';
+    setName(n); nameRef.current = n;
+    // 本地恢复：localStorage 里有一份不同的未保存编辑 → 提示恢复（与草稿同一套）
+    const local = readLocal(n);
+    let unsaved = false;
+    if (presetFull == null && local && typeof local.markdown === 'string' && local.markdown !== full && local.markdown.trim()) {
+      const when = new Date(local.ts).toLocaleString();
+      if (window.confirm(`「${n}」检测到一份本地未保存的理解层编辑（${when}），与 NAS 上已保存版本不同。\n\n确定 = 恢复这份未保存的编辑；\n取消 = 用 NAS 上已保存的版本。`)) {
+        full = local.markdown; unsaved = true;
+      }
+    }
+    const { fm, body } = splitFm(full);
+    dimFmRef.current = fm;
+    dimBaselineRef.current = full;
+    calibPromptedRef.current = false;
+    setDimLevel(fm.match(/^理解等级:\s*([^\s#]*)/m)?.[1] ?? '');
+    edRef.current?.setMarkdown(body);
+    mdRef.current = full;
+    writeLocal(n, full);
+    setPanelMd(''); setUsed([]); setToolsSeen([]); setPublishUrl(''); setErrorMsg(''); setPendingInsert('');
+    setStatusLine(unsaved ? '已恢复本地未保存的理解层编辑（记得点保存）' : '');
+    if (unsaved) { setSave('dirty'); setSavedAt(null); } else { setSave('saved'); setSavedAt(Date.now()); }
+    setShowDims(false);
+    setTimeout(() => { loadingRef.current = false; }, 200);
+  };
+
+  // 校准日志助手：保存（按钮触发）时内容变了但没新增带今天日期的校准行 → 轻提示可自动补一条（可跳过，不强制）
+  const maybeCalibPrompt = (md: string): string => {
+    const today = new Date().toISOString().slice(0, 10);
+    const cnt = (s: string) => (s.match(new RegExp(today, 'g')) || []).length;
+    if (md === dimBaselineRef.current || cnt(md) > cnt(dimBaselineRef.current) || calibPromptedRef.current) return md;
+    calibPromptedRef.current = true;
+    if (!window.confirm(`理解层内容改了，但没看到新的校准日志。\n\n要不要自动在文末补一条「- ${today} ｜ 校准：」让你填一句？\n（确定=补一条再保存；取消=直接保存）`)) return md;
+    const body = (edRef.current?.getMarkdown() ?? '') +
+      (md.includes('## 校准日志') ? `\n- ${today} ｜ 校准：` : `\n\n## 校准日志\n\n- ${today} ｜ 校准：`);
+    edRef.current?.setMarkdown(body);
+    const full = fullDimMd(body);
+    mdRef.current = full;
+    setStatusLine('已补校准日志行，请在文末填一句');
+    return full;
+  };
+
+  // frontmatter 理解等级 直接改（现在全是 0；改的是 frontmatter 那一行，正文不动）
+  const changeDimLevel = (v: string) => {
+    setDimLevel(v);
+    if (!/^理解等级:/m.test(dimFmRef.current)) return;
+    dimFmRef.current = dimFmRef.current.replace(/^(理解等级:\s*)[^\s#\n]*/m, `$1${v || '0'}`);
+    const full = fullDimMd(edRef.current?.getMarkdown() ?? '');
+    mdRef.current = full;
+    if (name) writeLocal(name, full);
+    setSave('dirty');
+    window.clearTimeout(saveTimer.current);
+    saveTimer.current = window.setTimeout(() => { saveNow(); }, 1500);
+  };
+
+  // 立即 flush 到 NAS（保存按钮 / 失焦 / beforeunload 前调用）。fromButton=手动保存（触发校准轻提示）
+  const saveNow = async (opts?: { fromButton?: boolean }) => {
     if (!name) return;
     window.clearTimeout(saveTimer.current);
-    const md = mdRef.current;
+    let md = mdRef.current;
+    const isDim = docTypeRef.current === 'dim';
+    if (isDim && opts?.fromButton) md = maybeCalibPrompt(md);
     setSave('saving');
-    try { await API.saveDraft(name, md); setSave('saved'); setSavedAt(Date.now()); writeLocal(name, md); }
-    catch (e: any) { setSave('dirty'); setErrorMsg('保存失败：' + (e.message || e) + '（内容仍在本地缓冲，别关页面，稍后重试保存）'); }
+    try {
+      if (isDim) await API.saveDimension(name, md);
+      else await API.saveDraft(name, md);
+      setSave('saved'); setSavedAt(Date.now()); writeLocal(name, md);
+    } catch (e: any) { setSave('dirty'); setErrorMsg('保存失败：' + (e.message || e) + '（内容仍在本地缓冲，别关页面，稍后重试保存）'); }
   };
 
   const onEditorUpdate = (md: string) => {
-    mdRef.current = md;
+    const full = docTypeRef.current === 'dim' ? fullDimMd(md) : md;   // 维度：拼回 frontmatter 存全文
+    mdRef.current = full;
     if (loadingRef.current || !name) return;
-    writeLocal(name, md);          // 触发之一：实时写本地缓冲（不丢）
+    writeLocal(name, full);        // 触发之一：实时写本地缓冲（不丢）
     setSave('dirty');
     window.clearTimeout(saveTimer.current);
     saveTimer.current = window.setTimeout(() => { saveNow(); }, 1500);  // debounce 自动存
@@ -189,7 +301,8 @@ export default function App() {
   const stream = async (path: string, body: any) => {
     setStreaming(true); setPanelMd(''); setUsed([]); setToolsSeen([]); setStatusLine('分析中…'); setPublishUrl(''); setErrorMsg('');
     let acc = '';
-    await API.sse(path, { ...body, name, model }, (e) => {
+    // docType 一起送后端：dim 时后端不得把内容当草稿写进 kb/writing（L3 只走 PUT /api/dimension）
+    await API.sse(path, { ...body, name, model, docType: docTypeRef.current }, (e) => {
       if (e.type === 'context') { setUsed(e.used); }
       else if (e.type === 'tool') { setToolsSeen((t) => [...t, e.name]); setStatusLine(`agent 正在用 ${e.name}…`); }
       else if (e.type === 'delta') { acc += e.text; setPanelMd(acc); setStatusLine(''); }
@@ -206,12 +319,20 @@ export default function App() {
   };
 
   // ---- 落笔候选 ----
+  // 落笔 = **人按的这一下**。插进编辑器后由 onEditorUpdate → saveNow() 走对应路由存盘：
+  // 草稿 → PUT /api/draft（kb/writing）；理解层 → PUT /api/dimension（kb/dimensions）。
+  // agent 自己的进程写不了 dimensions（api 档沙箱 denyWrite），"人经 UI 确认"是 L3 唯一的写入通道。
   const candidate = useMemo(() => (streaming ? null : extractCandidate(panelMd)), [panelMd, streaming]);
+  const afterApply = () => {
+    const isDim = docTypeRef.current === 'dim';
+    setStatusLine(isDim ? '已落笔到理解层（正在存回 kb/dimensions；记得补一条校准日志）' : '已落笔（可继续编辑/撤销）');
+    if (isDim) window.setTimeout(() => saveNow(), 0);   // L3 立即落盘，不等 1.5s debounce
+  };
   const applyCandidate = () => {
     if (!candidate) return;
     if (candidate.mode === 'replace' && selection) edRef.current?.replaceSelection(candidate.text);
     else edRef.current?.insertAtCursor(candidate.text);
-    setStatusLine('已落笔（可继续编辑/撤销）');
+    afterApply();
   };
 
   // ---- publish feedback ----
@@ -348,17 +469,20 @@ export default function App() {
     catch (e: any) { setErrorMsg('保存动作技能失败：' + e.message); }
   };
 
-  // ---- 版本历史 ----
+  // ---- 版本历史（草稿=#recycle/kb/writing；理解层=#recycle/kb/dimensions，L3 必须能回退）----
+  const vScope = (): API.VersionScope => (docTypeRef.current === 'dim' ? 'dimensions' : 'writing');
   const openVersions = async () => {
     setShowVersions(true); setVersions(null); setVersionsErr(''); setVersionPreview(null);
-    try { const r = await API.getVersions(name); setVersions(r.versions); if (!r.available) setVersionsErr('NAS 回收站不可读'); }
+    try { const r = await API.getVersions(name, vScope()); setVersions(r.versions); if (!r.available) setVersionsErr('NAS 回收站不可读'); }
     catch (e: any) { setVersionsErr(e.message?.includes('404') || e.message?.includes('Cannot') ? '版本历史需重启一次后端才生效（新功能）。' : ('读取失败：' + e.message)); }
   };
   const doRestore = async (file: string) => {
-    if (!window.confirm('恢复这个历史版本为一个「新文件」（不覆盖当前草稿）？之后可对照/合并。')) return;
-    const r = await API.restoreVersion(name, file);
-    await refreshDrafts(); setShowVersions(false); setVersionPreview(null);
-    openDraft(r.name);
+    const isDim = docTypeRef.current === 'dim';
+    if (!window.confirm(`恢复这个历史版本为一个「新文件」（不覆盖当前${isDim ? '理解层文件' : '草稿'}）？之后可对照/合并。`)) return;
+    const r = await API.restoreVersion(name, file, vScope());
+    setShowVersions(false); setVersionPreview(null);
+    if (isDim) { openDimension(r.name); }
+    else { await refreshDrafts(); openDraft(r.name); }
   };
 
   const panelHtml = useMemo(() => marked.parse(panelMd || '') as string, [panelMd]);
@@ -379,14 +503,15 @@ export default function App() {
     <div className="app">
       <header className="topbar">
         <b>kb-writer 写作台</b>
-        <select value={name} onChange={(e) => openDraft(e.target.value)}>
+        <select value={docType === 'draft' ? name : ''} onChange={(e) => openDraft(e.target.value)}>
           <option value="">— 选草稿 —</option>
           {drafts.map((d) => <option key={d.name} value={d.name}>{d.name}</option>)}
         </select>
         <button onClick={newDraft}>+ 新建</button>
+        <button className={docType === 'dim' ? 'on' : ''} onClick={openDims} title="理解层（kb/dimensions，L3 你的手写区）——在写作台里直接更新理解">📜 理解层</button>
         {name && (
           <>
-            <button className={saveState === 'dirty' ? 'primary' : ''} disabled={!name || saveState === 'saving'} onClick={saveNow} title="立即保存到 NAS（也有自动存兜底）">
+            <button className={saveState === 'dirty' ? 'primary' : ''} disabled={!name || saveState === 'saving'} onClick={() => saveNow({ fromButton: true })} title="立即保存到 NAS（也有自动存兜底）">
               {saveState === 'saving' ? '保存中…' : '保存'}
             </button>
             <span className={`savestate ${saveState}`}>
@@ -402,18 +527,36 @@ export default function App() {
           </select>
         </label>
         <label className="switch"><input type="checkbox" checked={autoReview} onChange={(e) => setAutoReview(e.target.checked)} /> 停顿即评</label>
-        <button onClick={() => { setDrawer(true); refreshBasket(); if (!allSkills) API.getInstalledSkills().then(setAllSkills).catch(() => setAllSkills([])); }}>上下文 ({basket.sources.filter((s) => s.enabled).length}){mountedSkills.length > 0 ? ` ·技${mountedSkills.length}` : ''}</button>
+        <button disabled={docType === 'dim'} onClick={() => { setDrawer(true); refreshBasket(); if (!allSkills) API.getInstalledSkills().then(setAllSkills).catch(() => setAllSkills([])); }}>上下文 ({basket.sources.filter((s) => s.enabled).length}){mountedSkills.length > 0 ? ` ·技${mountedSkills.length}` : ''}</button>
         <button className={showAgents ? 'on' : ''} onClick={() => (showAgents ? setShowAgents(false) : openAgents())} title="次要助手：并行派 补写/调研 子任务，产出要过审才落笔">多 agent 助手</button>
-        {name && <button onClick={openVersions} title="NAS 回收站里每次自动存的历史版本，可恢复成新文件">版本历史</button>}
+        {name && <button onClick={openVersions} title="NAS 回收站里每次自动存的历史版本，可恢复成新文件">版本历史{docType === 'dim' ? '（L3）' : ''}</button>}
       </header>
 
       <div className="body">
-        <section className="left">
+        <section className={`left${docType === 'dim' ? ' l3mode' : ''}`}>
           {!name && <div className="hint">选一篇草稿或新建，开始写。草稿存到 kb/writing/。</div>}
+          {docType === 'dim' && name && (
+            <div className="l3banner">
+              <div className="l3title">📜 理解层（L3）· {name} —— <b>你的手写区</b></div>
+              <div className="l3sub">
+                agent 可协助（批改 / 补充 / 修正 / 提问 / 多 agent），但<b>落笔由你确认</b>——它只能提议，写进 L3 的永远是你按的那一下。
+                改完记得在文末补一条带日期的校准日志。frontmatter 已保护（保存时原样拼回）。
+                <span className="l3level">理解等级：<input value={dimLevel} maxLength={3} placeholder="0"
+                  onChange={(e) => changeDimLevel(e.target.value.replace(/[^0-9]/g, ''))} title="1–5 自评；现在还是 0" /></span>
+              </div>
+            </div>
+          )}
           <Editor ref={edRef} onUpdate={onEditorUpdate} onSelectionChange={setSelection} onBlur={() => { if (dirtyRef.current) saveNow(); }} />
         </section>
 
         <section className="right">
+          {docType === 'dim' && (
+            <div className="l3note">
+              理解层编辑模式：agent 动作照常可用，但产出一律是<b>提议</b>——只有你点「确认落笔」才进正文，
+              保存走理解层路由（<code>kb/dimensions/</code>）。agent 自己的进程被沙箱 denyWrite 挡死，永远写不进 dimensions。
+              「版本历史（L3）」可回退——每次保存 NAS 回收站都留了一版。
+            </div>
+          )}
           <div className="actions">
             <button className="primary" disabled={!name || streaming} onClick={() => runReview(false)}>批改整篇</button>
             <span className="sel-actions" data-active={!!selection}>
@@ -423,6 +566,19 @@ export default function App() {
               <button disabled={!selection || streaming} onClick={() => runAct('draft')}>一起写</button>
             </span>
           </div>
+          {/* 选区预览：左边选完点到右侧面板时编辑器会失焦，用户看不出选没选中、选的是哪段。
+              这里实时回显（首尾各留一截，两头都能对上），配合编辑器里失焦保留的高亮。 */}
+          <div className={`selpreview ${selection ? 'on' : ''}`}>
+            {selection
+              ? <>已选 <b>{selection.length}</b> 字：<span className="selquote">「{selPreview(selection)}」</span></>
+              : <>未选中 —— 先在左边选一段，「补充 / 修正 / 提问 / 一起写 / 问」才会对那段生效</>}
+          </div>
+          {!isAgenticModel(model) && (
+            <div className="modelnote">
+              ⓘ DeepSeek 无工具、<b>不会自己检索知识库</b>：它只看「上下文」篮子里挂好的东西（实体页 / 文件 / PDF——后端已抽成文本 / 已钉的接口快照）。
+              要它用到库里的事实，先去「上下文」把相关实体或文件挂上；live 接口源它也拉不了，得先「钉快照」。
+            </div>
+          )}
           <div className="ask-row">
             <input value={question} placeholder={selection ? '就选中这段问一句…' : '先在左边选一段文字'} disabled={!selection || streaming}
               onChange={(e) => setQuestion(e.target.value)}
@@ -446,15 +602,15 @@ export default function App() {
 
           {pendingInsert && !streaming && (
             <div className="candidate">
-              <div className="cand-head">已审 · 这段是 agent 补写的,确认才落笔(上面是它的"对不对")</div>
+              <div className="cand-head">已审 · 这段是 agent 补写的,确认才落笔(上面是它的"对不对"){docType === 'dim' ? ' — 落笔进理解层 kb/dimensions' : ''}</div>
               <pre>{pendingInsert}</pre>
-              <button className="primary" onClick={() => { edRef.current?.insertAtCursor(pendingInsert); setPendingInsert(''); setStatusLine('已落笔'); }}>确认落笔</button>
+              <button className="primary" onClick={() => { edRef.current?.insertAtCursor(pendingInsert); setPendingInsert(''); afterApply(); }}>确认落笔</button>
               <button onClick={() => { setPendingInsert(''); setStatusLine('已弃用这段'); }}>弃用</button>
             </div>
           )}
           {candidate && (
             <div className="candidate">
-              <div className="cand-head">agent 提议（{candidate.mode === 'replace' ? '替换选中段' : '插入正文'}）— 确认才落笔</div>
+              <div className="cand-head">agent 提议（{candidate.mode === 'replace' ? '替换选中段' : '插入正文'}）— 确认才落笔{docType === 'dim' ? ' · 落笔进理解层 kb/dimensions' : ''}</div>
               <pre>{candidate.text}</pre>
               <button className="primary" onClick={applyCandidate}>确认落笔</button>
               <button onClick={() => setStatusLine('已忽略提议')}>忽略</button>
@@ -471,7 +627,7 @@ export default function App() {
           )}
 
           {showAgents && (
-            <div className="agents">
+            <div className="agents" ref={agentsRef}>
               <div className="agents-head">
                 <b>多 agent 助手</b><span className="muted">（次要 · 审「对不对」才是主）</span>
                 {taskBudget && <span className="budget">并发 {taskBudget.running}/{taskBudget.maxParallel} · 花费 ${taskBudget.spent}/${taskBudget.budget}</span>}
@@ -484,7 +640,10 @@ export default function App() {
                 </select>
                 <input value={agentInstr} placeholder={agentType === 'research' ? '调研什么（如：安克海外渠道结构）' : '补写什么（如：扩写"浅海战略"这段）'}
                   onChange={(e) => setAgentInstr(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') dispatchTask(); }} />
-                <button className="primary" disabled={!name || !agentInstr.trim()} onClick={dispatchTask}>派</button>
+                {/* disabled 要和 dispatchTask 的早返回条件一致，否则批改流式中点「派」是静默无反应 */}
+                <button className="primary" disabled={!name || !agentInstr.trim() || streaming}
+                  title={streaming ? '批改/选段动作还在流式输出，等它完成再派' : '派一个并行子任务'}
+                  onClick={dispatchTask}>派</button>
               </div>
               {Object.values(runs).slice().reverse().map((r) => (
                 <div key={r.id} className={`run ${r.status}`}>
@@ -701,11 +860,30 @@ export default function App() {
         </div>
       )}
 
+      {showDims && (
+        <div className="drawer-mask" onClick={() => setShowDims(false)}>
+          <aside className="drawer" onClick={(e) => e.stopPropagation()}>
+            <div className="drawer-head"><b>📜 理解层（kb/dimensions · L3）</b><button onClick={() => setShowDims(false)}>×</button></div>
+            <p className="muted">你的手写区：维度文件 = 主人裁定的理解正文。点开在编辑器里直接改；agent 只读不代笔；改完记得在文末补一条带日期的校准日志。</p>
+            {dims === null && <p className="muted">读取中…</p>}
+            {dims && dims.length === 0 && <p className="muted">kb/dimensions/ 下还没有维度文件。</p>}
+            {dims && dims.map((d) => (
+              <div key={d.name} className="src">
+                <div><b>{d.name}</b> <span className="muted">· {(d.size / 1024).toFixed(1)}KB · {new Date(d.mtime).toLocaleString()}</span></div>
+                <div className="src-meta">
+                  <button className="primary" onClick={() => openDimension(d.name)}>打开编辑</button>
+                </div>
+              </div>
+            ))}
+          </aside>
+        </div>
+      )}
+
       {showVersions && (
         <div className="drawer-mask" onClick={() => setShowVersions(false)}>
           <aside className="drawer" onClick={(e) => e.stopPropagation()}>
-            <div className="drawer-head"><b>版本历史 · {name}</b><button onClick={() => setShowVersions(false)}>×</button></div>
-            <p className="muted">NAS 回收站里每次自动存留下的历史版本。恢复会存成**新文件**（不覆盖当前草稿），可对照/合并。</p>
+            <div className="drawer-head"><b>版本历史{docType === 'dim' ? '（L3）' : ''} · {name}</b><button onClick={() => setShowVersions(false)}>×</button></div>
+            <p className="muted">NAS 回收站里每次自动存留下的历史版本。恢复会存成**新文件**（不覆盖当前{docType === 'dim' ? '理解层文件' : '草稿'}），可对照/合并。</p>
             {versionsErr && <div className="errbanner">⚠️ {versionsErr}</div>}
             {versions === null && !versionsErr && <p className="muted">读取中…</p>}
             {versions && versions.length === 0 && !versionsErr && <p className="muted">这个草稿在回收站还没有历史版本（保存几次后会出现）。</p>}
@@ -713,7 +891,7 @@ export default function App() {
               <div key={v.file} className="src">
                 <div><b>{new Date(v.mtime).toLocaleString()}</b> <span className="muted">· {(v.size / 1024).toFixed(1)}KB</span></div>
                 <div className="src-meta">
-                  <button onClick={async () => { try { setVersionPreview(await API.getVersion(v.file)); } catch (e: any) { setVersionsErr(e.message); } }}>预览</button>
+                  <button onClick={async () => { try { setVersionPreview(await API.getVersion(v.file, vScope())); } catch (e: any) { setVersionsErr(e.message); } }}>预览</button>
                   <button className="primary" onClick={() => doRestore(v.file)}>恢复为新文件</button>
                 </div>
               </div>

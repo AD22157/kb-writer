@@ -53,6 +53,18 @@ export function writeSessionSettings() {
   };
 }
 
+// —— api 档专有的 denyWrite（只收紧，不放松）——
+// 坑：Seatbelt 沙箱不约束 cwd 子树，而 cwd = KB_ROOT。于是 api 档（唯一有 Bash 的档）下
+// 整个 kb 树都可写，`allowWrite: kb/writing/**` 名不副实——实测 `echo > kb/dimensions/x.md` 成功。
+// 这违反宪法「agent 任何路径不得写 dimensions/entities」。这里对 kb 下「除 writing 外」的子树显式 denyWrite。
+// denyWrite 与 denyRead 的 fail-closed 重叠坑无关（读仍全库 allow，只是写不进去）。
+// 目录本身与 /** 都列上：前者挡 rm/替换目录，后者挡目录内文件。
+const KB_READONLY_SUBTREES = ['dimensions', 'entities', 'raw', '_schema', 'weekly']
+  .flatMap((d) => [`${KB_ABS}/${d}`, `${KB_ABS}/${d}/**`]);
+// 提权路径：cwd/.claude/settings*.json 会被 --setting-sources project 读进下一次会话，
+// 能给自己加 allow / 关沙箱。精确 deny 这两个文件（不动 .claude/.cc-writes，那是 CC 自己的记账目录）。
+const KB_PROJECT_SETTINGS_DENY = [`${KB_ABS}/.claude/settings.json`, `${KB_ABS}/.claude/settings.local.json`];
+
 // live-API 会话：额外放行 Skill+Bash 跑网关只读 client。沙箱把 Bash 硬关——
 // 网络只 gateway host、写只 kb/writing、读 deny 敏感目录（网关 token 精确放行给 client）。
 // 残留（已知、可接受）：因 network 锁死到网关，Bash 即便读到 ~/sync/env 等也无法外泄；
@@ -64,6 +76,8 @@ export function apiSessionSettings() {
     abs('sync/skills/**'),                    // 符号链真实路径；故不能 deny ~/sync 下任何子树
     abs('.openclaw/secrets/gateway-token'),   // 精确放行这一个密钥文件给 client（绝对路径才稳）
   ], [gatewayHost]);
+  // 仅 api 档收紧：kb 树里除 writing 外全部只读（Bash 只有这一档有）。write/research 档不动。
+  sbx.filesystem.denyWrite = [...sbx.filesystem.denyWrite, ...KB_READONLY_SUBTREES, ...KB_PROJECT_SETTINGS_DENY];
   return {
     sandbox: sbx,
     permissions: {

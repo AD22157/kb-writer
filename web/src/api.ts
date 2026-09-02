@@ -116,11 +116,22 @@ export const getActionSkill = (action: string) => api(`/api/action-skill?action=
 export const putActionSkill = (action: string, content: string) =>
   api('/api/action-skill', { method: 'PUT', body: JSON.stringify({ action, content }) }) as Promise<ActionSkill>;
 
-// ---- 版本历史（NAS 回收站）----
+// ---- 理解层（kb/dimensions，L3 主人手写区；唯一可写机器路径=这条用户 UI 路由）----
+export interface Dimension { name: string; mtime: number; size: number }
+export const listDimensions = () => api('/api/dimensions').then((r) => r.dimensions as Dimension[]);
+export const loadDimension = (name: string) => api(`/api/dimension?name=${encodeURIComponent(name)}`) as Promise<{ name: string; markdown: string; exists: boolean }>;
+export const saveDimension = (name: string, markdown: string) =>
+  api('/api/dimension', { method: 'PUT', body: JSON.stringify({ name, markdown }) });
+
+// ---- 版本历史（NAS 回收站；scope=writing 草稿 | dimensions 理解层）----
+export type VersionScope = 'writing' | 'dimensions';
 export interface Version { file: string; mtime: number; size: number }
-export const getVersions = (name: string) => api(`/api/versions?name=${encodeURIComponent(name)}`) as Promise<{ available: boolean; versions: Version[] }>;
-export const getVersion = (file: string) => api(`/api/version?file=${encodeURIComponent(file)}`) as Promise<{ file: string; content: string }>;
-export const restoreVersion = (name: string, file: string) => api('/api/version/restore', { method: 'POST', body: JSON.stringify({ name, file }) }) as Promise<{ ok: boolean; name: string }>;
+export const getVersions = (name: string, scope: VersionScope = 'writing') =>
+  api(`/api/versions?name=${encodeURIComponent(name)}&scope=${scope}`) as Promise<{ available: boolean; versions: Version[] }>;
+export const getVersion = (file: string, scope: VersionScope = 'writing') =>
+  api(`/api/version?file=${encodeURIComponent(file)}&scope=${scope}`) as Promise<{ file: string; content: string }>;
+export const restoreVersion = (name: string, file: string, scope: VersionScope = 'writing') =>
+  api('/api/version/restore', { method: 'POST', body: JSON.stringify({ name, file, scope }) }) as Promise<{ ok: boolean; name: string; scope: VersionScope }>;
 
 // 派一个子任务（write=补写 / research=调研），流式回调（事件带 id）。
 export async function runTask(
