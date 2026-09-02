@@ -60,6 +60,7 @@ export function addSource(name, src) {
     label: src.label || id,
   };
   if (src.type === 'file') clean.path = src.path;
+  if (src.type === 'raw') { clean.rel = src.rel; clean.mode = 'snapshot'; }   // 知识库原文（书/长文），存相对路径，装配时再解析
   if (src.type === 'api') { clean.skill = src.skill || 'papablic-data'; clean.query = src.query || ''; }
   if (src.type === 'web' || src.type === 'feishu') clean.ref = src.ref || '';
   if (src.type === 'entity') {
@@ -221,18 +222,96 @@ export function extractIndexSection(entityType) {
   } catch { return null; }
 }
 
-// 读文件源内容（bounded）。返回 {text, truncated} 或 null（读不了/非文本）。
+// 读文件源内容（bounded）。返回 {text, truncated, fullChars} 或 null（读不了/非文本）。
+// limit 可覆写默认（raw/书 源用更大的上限尽量全文注入）。
 const FILE_INLINE_LIMIT = 24000;
-export function readFileSource(p) {
+export function readFileSource(p, limit = FILE_INLINE_LIMIT) {
   try {
     const buf = fs.readFileSync(p);
     // 粗判文本：无 NUL 字节
     if (buf.includes(0)) return { text: null, binary: true };
-    let text = buf.toString('utf8');
-    let truncated = false;
-    if (text.length > FILE_INLINE_LIMIT) { text = text.slice(0, FILE_INLINE_LIMIT); truncated = true; }
-    return { text, truncated, binary: false };
+    const full = buf.toString('utf8');
+    const cap = Number(limit) > 0 ? Number(limit) : FILE_INLINE_LIMIT;
+    const truncated = full.length > cap;
+    return { text: truncated ? full.slice(0, cap) : full, truncated, fullChars: full.length, limit: cap, binary: false };
   } catch (e) {
     return { text: null, error: String(e.message || e) };
   }
+}
+
+// ---- 知识库原料层（kb/raw/，书/长文/文档），供「挂 raw」浏览与挂载 ----
+// 安全：只读、严格锁在 kb/raw/ 子树内（realpath 兜底防符号链越界），NAS 中文名是 NFD 一律 NFC 归一。
+const RAW_DIR = path.join(CONFIG.KB_ROOT, 'raw');
+// 明显的媒体/二进制（抽不出文本，挂了无意义）——列表里剔掉，聚焦"书/长文/文档"。
+const RAW_MEDIA_EXT = new Set([
+  'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'heic', 'heif', 'tiff', 'ico',
+  'mp3', 'm4a', 'wav', 'flac', 'aac', 'ogg', 'opus',
+  'mp4', 'mov', 'avi', 'mkv', 'webm', 'm4v',
+  'zip', 'gz', 'tar', '7z', 'rar', 'exe', 'dmg',
+]);
+const RAW_TEXT_EXT = new Set(['md', 'markdown', 'txt', 'csv', 'tsv', 'json', 'vtt', 'srt', 'log', 'yaml', 'yml', 'html', 'htm']);
+const rawExt = (n) => { const m = nfc(n).match(/\.([^.\/\\]+)$/); return m ? m[1].toLowerCase() : ''; };
+const rawKind = (ext) => (ext === 'pdf' ? 'pdf' : RAW_TEXT_EXT.has(ext) ? 'text' : 'other');
+
+// 递归列 kb/raw/ 下可挂载文件。q=按相对路径子串过滤(NFC、大小写不敏感)。
+// 剔除：隐藏项、下划线开头的簿记项(_failed/_log.md)、媒体/压缩包。默认按 mtime 倒序(新加入的书/长文在前)。
+// 返回 { root, files:[{rel,name,dir,ext,kind,bytes,mtime}], total, truncated }。
+const RAW_LIST_CAP = 800;
+export function listRawFiles(q = '', { cap = RAW_LIST_CAP } = {}) {
+  const out = [];
+  const want = nfc(String(q || '')).trim().toLowerCase();
+  const walk = (absDir, relDir, depth) => {
+    if (depth > 8) return;
+    let ents;
+    try { ents = fs.readdirSync(absDir, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      const nm = nfc(e.name);
+      if (nm.startsWith('.') || nm.startsWith('_')) continue;      // 隐藏 + 簿记项
+      const rel = relDir ? `${relDir}/${nm}` : nm;
+      if (e.isDirectory()) { walk(path.join(absDir, e.name), rel, depth + 1); continue; }
+      if (!e.isFile()) continue;
+      const ext = rawExt(nm);
+      if (RAW_MEDIA_EXT.has(ext)) continue;
+      if (want && !rel.toLowerCase().includes(want)) continue;
+      let bytes = 0, mtime = 0;
+      try { const st = fs.statSync(path.join(absDir, e.name)); bytes = st.size; mtime = st.mtimeMs; } catch { /* skip stat */ }
+      out.push({ rel, name: nm, dir: relDir, ext, kind: rawKind(ext), bytes, mtime });
+    }
+  };
+  walk(RAW_DIR, '', 0);
+  out.sort((a, b) => b.mtime - a.mtime);
+  const total = out.length;
+  return { root: RAW_DIR, total, truncated: total > cap, files: out.slice(0, cap) };
+}
+
+// 解析 raw 相对路径 → 磁盘真实绝对路径（NFD 兼容 + realpath 越界兜底）。找不到/越界返回 null。
+// 逐段 NFC 扫目录匹配（不直接拼路径，NAS 名是 NFD），最后 realpath 必须仍在 RAW_DIR 之内。
+export function resolveRawPath(rel) {
+  const raw = nfc(String(rel || '')).trim().replace(/^\/+/, '');
+  if (!raw || raw.includes('..') || raw.includes('\0')) return null;
+  const segs = raw.split('/').filter((s) => s && s !== '.');
+  if (!segs.length) return null;
+  let absDir = RAW_DIR;
+  const realParts = [];
+  for (let i = 0; i < segs.length; i++) {
+    const wantSeg = segs[i].toLowerCase();
+    let hit = null;
+    let ents;
+    try { ents = fs.readdirSync(absDir); } catch { return null; }
+    for (const fn of ents) { if (nfc(fn).toLowerCase() === wantSeg) { hit = fn; break; } }
+    if (hit == null) return null;
+    realParts.push(nfc(hit));
+    absDir = path.join(absDir, hit);
+    if (i < segs.length - 1) {
+      try { if (!fs.statSync(absDir).isDirectory()) return null; } catch { return null; }
+    }
+  }
+  // realpath 兜底：跟随符号链后仍必须落在 RAW_DIR 内（防越界）
+  try {
+    const real = fs.realpathSync(absDir);
+    const rootReal = fs.realpathSync(RAW_DIR);
+    if (real !== rootReal && !real.startsWith(rootReal + path.sep)) return null;
+    if (!fs.statSync(absDir).isFile()) return null;
+  } catch { return null; }
+  return { path: absDir, rel: realParts.join('/') };
 }

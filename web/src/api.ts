@@ -63,7 +63,7 @@ export async function sse(path: string, body: any, onEvent: (e: SseEvent) => voi
 export interface Draft { name: string; mtime: number }
 export interface Source {
   id: string; type: string; enabled: boolean; mode: string; label: string;
-  path?: string; skill?: string; query?: string; ref?: string;
+  path?: string; rel?: string; skill?: string; query?: string; ref?: string;
   entityType?: string; entity?: string;
   snapshot?: string; snapshotAt?: string;
 }
@@ -95,6 +95,10 @@ export async function uploadAttachment(name: string, file: File): Promise<{ bask
 // 实体清单（挂实体 UI 选单）：{公司:[{name,bytes}],人:[…],产品:[…],dimensions:[{name,path}]}
 export interface KbEntity { name: string; bytes?: number; path?: string }
 export const getKbEntities = () => api('/api/kb/entities') as Promise<Record<string, KbEntity[]>>;
+// 知识库原文（kb/raw/ 的书/长文/文档；挂 raw UI 选单）。q=服务端按路径子串过滤。
+export interface RawFile { rel: string; name: string; dir: string; ext: string; kind: 'pdf' | 'text' | 'other'; bytes: number; mtime: number }
+export interface RawListing { root: string; total: number; truncated: boolean; files: RawFile[] }
+export const getKbRaw = (q = '') => api(`/api/kb/raw?q=${encodeURIComponent(q)}`) as Promise<RawListing>;
 export const publishFeedback = (name: string, feedbackMarkdown: string) =>
   api('/api/publish-feedback', { method: 'POST', body: JSON.stringify({ name, feedbackMarkdown }) });
 

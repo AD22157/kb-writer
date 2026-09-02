@@ -96,6 +96,11 @@ export default function App() {
   const [showEntities, setShowEntities] = useState(false);
   const [entType, setEntType] = useState<'公司' | '人' | '产品' | '维度L3'>('公司');
   const [kbEnts, setKbEnts] = useState<Record<string, API.KbEntity[]> | null>(null);
+  // 知识库原文挂载（kb/raw/ 的书/长文/文档 → 全文注入）
+  const [showRaw, setShowRaw] = useState(false);
+  const [rawList, setRawList] = useState<API.RawListing | null>(null);
+  const [rawQ, setRawQ] = useState('');
+  const rawTimer = useRef<number | undefined>(undefined);
   // 本文工作记忆（.memory.md sidecar；跨模型持久。主人区=权威，agent 记的=提案）
   const [showMemory, setShowMemory] = useState(false);
   const [memory, setMemory] = useState<API.MemorySections | null>(null);
@@ -419,6 +424,25 @@ export default function App() {
       if (ex) setBasket(await API.delSource(name, ex.id));
       else setBasket(await API.addSource(name, { type: 'entity-all', entityType: t, mode: 'index', label: `所有${t}` }));
     } catch (e: any) { setErrorMsg(String(e.message || e)); }
+  };
+  // ---- 知识库原文（raw）挂载 ----
+  const loadRaw = async (q = '') => {
+    try { setRawList(await API.getKbRaw(q)); }
+    catch (e: any) { setErrorMsg('读 raw 清单失败：' + (e.message || e)); setRawList({ root: '', total: 0, truncated: false, files: [] }); }
+  };
+  const openRawPicker = async () => { setShowRaw(true); setRawList(null); await loadRaw(rawQ); };
+  const onRawQ = (v: string) => {                    // 服务端搜索（防抖）：raw 可能上千文件，前端过滤不够，须带 q 到端点
+    setRawQ(v);
+    window.clearTimeout(rawTimer.current);
+    rawTimer.current = window.setTimeout(() => loadRaw(v), 250);
+  };
+  const rawSrcOf = (rel: string) => basket.sources.find((s) => s.type === 'raw' && s.rel === rel);
+  const toggleRaw = async (f: API.RawFile) => {
+    const ex = rawSrcOf(f.rel);
+    try {
+      if (ex) setBasket(await API.delSource(name, ex.id));
+      else setBasket(await API.addSource(name, { type: 'raw', rel: f.rel, label: f.name, mode: 'snapshot' }));
+    } catch (e: any) { setErrorMsg('挂 raw 失败：' + (e.message || e)); }
   };
   const dimSrcOf = (p?: string) => basket.sources.find((s) => s.type === 'file' && s.path === p);
   const toggleDim = async (d: API.KbEntity) => {
@@ -791,6 +815,7 @@ export default function App() {
                   {s.skill && <span className="chip">{s.skill}</span>}
                   {s.query && <span className="q">“{s.query}”</span>}
                   {s.path && <span className="q">{s.path}</span>}
+                  {s.rel && <span className="q">kb/raw/{s.rel}</span>}
                   {s.snapshotAt && <span className="q">钉于 {new Date(s.snapshotAt).toLocaleString()}</span>}
                   {s.type === 'api' && <button onClick={() => snapshot(s)}>钉快照</button>}
                   {s.type !== 'kb' && <button onClick={() => delSource(s)}>删</button>}
@@ -809,6 +834,7 @@ export default function App() {
             </label>
             <div className="add-src">
               <button onClick={openEntityPicker} disabled={!name} title="把 公司/人/产品 实体页（L2 事实）或维度（L3）挂进上下文">+ 挂实体</button>
+              <button onClick={openRawPicker} disabled={!name} title="从 kb/raw/ 选具体原文（书/长文/文档）挂进上下文，全文注入">+ 挂 raw/书</button>
               <button onClick={addApi} disabled={!name}>+ 挂 API（papablic-data）</button>
               <button onClick={addFile} disabled={!name} title="挂 mini 本机已有文件的路径">+ 挂 mini 本机文件</button>
             </div>
@@ -901,6 +927,30 @@ export default function App() {
               );
             })}
             {kbEnts && entType === '维度L3' && !(kbEnts.dimensions || []).length && <p className="muted">kb/dimensions/ 下还没有维度文件。</p>}
+          </aside>
+        </div>
+      )}
+
+      {showRaw && (
+        <div className="drawer-mask" onClick={() => setShowRaw(false)}>
+          <aside className="drawer" onClick={(e) => e.stopPropagation()}>
+            <div className="drawer-head"><b>挂 raw / 书 · {name}</b><button onClick={() => setShowRaw(false)}>×</button></div>
+            <p className="muted">从 kb/raw/ 选具体原文（书 / 长文 / 文档）挂进上下文，<b>全文注入</b>。PDF 由服务端抽成文本；超大部头（招股书/年报）按上限截断并注明"仅前 N 字"。挂上后与其它源一样可勾选启用/卸载。用搜索定位你要的那几本。</p>
+            <input className="raw-search" placeholder="按文件名 / 路径搜索（如 招股 / 访谈 / 年报）" value={rawQ} onChange={(e) => onRawQ(e.target.value)} />
+            {rawList === null && <p className="muted">读取中…</p>}
+            {rawList && <p className="muted">{rawList.total} 个可挂文件{rawList.truncated ? `（按新旧只显示前 ${rawList.files.length}，请用搜索缩小范围）` : ''}</p>}
+            {rawList && rawList.files.map((f) => {
+              const on = !!rawSrcOf(f.rel);
+              return (
+                <div key={f.rel} className={`src ${on ? '' : 'off'}`}>
+                  <label><input type="checkbox" checked={on} onChange={() => toggleRaw(f)} /> <b>{f.name}</b>
+                    <span className="chip">{f.kind}</span>
+                    <span className="muted"> · {f.bytes >= 1048576 ? (f.bytes / 1048576).toFixed(1) + 'MB' : (f.bytes / 1024).toFixed(0) + 'KB'}</span></label>
+                  {f.dir && <div className="src-meta"><span className="q">{f.dir}/</span></div>}
+                </div>
+              );
+            })}
+            {rawList && !rawList.files.length && <p className="muted">没有匹配的文件。</p>}
           </aside>
         </div>
       )}

@@ -2,10 +2,11 @@ import path from 'node:path';
 import { CONFIG } from './config.mjs';
 import {
   readBasket, readFileSource, readEntityPage, listEntityPages, classTotalChars, extractIndexSection,
+  resolveRawPath,
 } from './contextStore.mjs';
 import { oneShot } from './claudeSession.mjs';
 import { skillMeta } from './skillsRegistry.mjs';
-import { inlineBinaryText, PDF_INLINE_LIMIT } from './fileExtract.mjs';
+import { inlineBinaryText, PDF_INLINE_LIMIT, isPdfPath } from './fileExtract.mjs';
 import { buildMemoryBlock } from './memoryStore.mjs';
 
 // 上下文装配器：批改/提问前，把篮子里"启用"的源汇总成一段上下文文本，
@@ -126,6 +127,43 @@ export function assemble(name, { agentic = true, kbTool = false } = {}) {
         }
       } else {
         parts.push(`### 挂载文件：${s.label}\n（读取失败：${r.error || '未知'}，本次跳过）`);
+      }
+      continue;
+    }
+    if (s.type === 'raw') {
+      // 知识库原文（kb/raw/ 的书/长文/文档），全文注入。每次装配都从相对路径重解析（不信存下的绝对路径），
+      // realpath 锁死在 kb/raw/ 内。上限 RAW_INLINE_LIMIT（比实体页/文件大得多），超限截断带清晰尾注（绝不静默截）。
+      const hit = resolveRawPath(s.rel);
+      if (!hit) {
+        parts.push(`### 挂载知识库原文（raw）：${s.label}\n（kb/raw/ 下找不到「${s.rel}」（可能已移动/删除），本次跳过）`);
+        used.push({ id: s.id, label: s.label, mode: 'missing', type: 'raw' });
+        continue;
+      }
+      const LIMIT = CONFIG.RAW_INLINE_LIMIT;
+      const isPdf = isPdfPath(hit.path);
+      const r = !isPdf ? readFileSource(hit.path, LIMIT) : { text: null, binary: true };
+      if (r.text != null) {
+        const tail = r.truncated
+          ? `\n（⚠️ 全文共 ${r.fullChars} 字符，仅注入前 ${LIMIT} 字${agentic ? `；余下请用 Read 工具读原件 \`${hit.path}\`` : '；余下当前模型看不到，涉及处标 🟡 待核，或调高 KB_WRITER_RAW_INLINE_LIMIT / 少挂几份'}）`
+          : '';
+        parts.push(`### 挂载知识库原文（raw · 书/长文 · 全文 snapshot）：${s.label}\nkb/raw/${hit.rel}${r.truncated ? '（已截断）' : ''}\n\`\`\`\n${r.text}\n\`\`\`${tail}`);
+        used.push({ id: s.id, label: s.label, mode: r.truncated ? 'raw(全文·已截断)' : 'raw(全文)', type: 'raw' });
+      } else {
+        // 二进制：PDF 走服务端抽取（更大上限）；抽不出（扫描件/docx 等）如实报，不静默当没这份。
+        const ex = inlineBinaryText(hit.path, LIMIT);
+        if (ex.text) {
+          const tail = ex.truncated
+            ? `\n（⚠️ 全文共 ${ex.fullChars} 字符，仅注入前 ${ex.limit} 字${agentic ? `；余下请用 Read 工具读原件 \`${hit.path}\`` : '；余下当前模型看不到，涉及处标 🟡 待核，或调高 KB_WRITER_RAW_INLINE_LIMIT / 少挂几份'}）`
+            : '';
+          parts.push(`### 挂载知识库原文（raw · PDF·服务端已抽成文本 · snapshot）：${s.label}\nkb/raw/${hit.rel}（抽取器 ${ex.via}，${ex.fullChars} 字符）\n\`\`\`\n${ex.text}\n\`\`\`${tail}`);
+          used.push({ id: s.id, label: s.label, mode: ex.truncated ? 'raw(PDF文本·已截断)' : 'raw(PDF文本)', type: 'raw' });
+        } else if (agentic) {
+          parts.push(`### 挂载知识库原文（raw）：${s.label}\nkb/raw/${hit.rel}\n二进制/PDF，服务端未能抽出文本（${ex.error || '不支持的格式，如 docx/pptx 或扫描件'}），请用 Read 工具读取：\`${hit.path}\``);
+          used.push({ id: s.id, label: s.label, mode: 'raw(read-on-demand)', type: 'raw' });
+        } else {
+          parts.push(`### 挂载知识库原文（raw）：${s.label}\nkb/raw/${hit.rel}\n二进制文件，服务端未能抽出文本（${ex.error || '不支持的格式'}）；当前模型无工具读不了它——涉及这份文件的内容一律标 🟡 待核，不要猜。`);
+          used.push({ id: s.id, label: s.label, mode: 'raw(不可读)', type: 'raw' });
+        }
       }
       continue;
     }

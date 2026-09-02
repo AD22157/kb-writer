@@ -101,13 +101,15 @@ export function extractPdfText(p) {
 }
 
 // 装配器用：抽出并按 inline 上限截断（超限带尾注，绝不静默截）。
-export function inlineBinaryText(p) {
+// limit 可覆写默认 PDF_INLINE_LIMIT —— raw/书 源用更大的上限（KB_WRITER_RAW_INLINE_LIMIT）尽量全文注入。
+export function inlineBinaryText(p, limit = PDF_INLINE_LIMIT) {
   const r = extractPdfText(p);
   if (r.text == null) return { text: null, error: r.error };
   const full = r.text.length;
-  const truncated = full > PDF_INLINE_LIMIT;
+  const cap = Number(limit) > 0 ? Number(limit) : PDF_INLINE_LIMIT;
+  const truncated = full > cap;
   return {
-    text: truncated ? r.text.slice(0, PDF_INLINE_LIMIT) : r.text,
-    truncated, fullChars: full, via: r.via, cached: !!r.cached,
+    text: truncated ? r.text.slice(0, cap) : r.text,
+    truncated, fullChars: full, limit: cap, via: r.via, cached: !!r.cached,
   };
 }

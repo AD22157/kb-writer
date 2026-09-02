@@ -14,6 +14,7 @@ import { assemble, snapshotApiSource } from './contextAssembler.mjs';
 import {
   readBasket, addSource, updateSource, removeSource, writeBasket, saveAttachment,
   ENTITY_TYPES, listEntities, resolveEntityPage, classTotalChars,
+  listRawFiles, resolveRawPath,
 } from './contextStore.mjs';
 import { TOKEN, requireToken, lanAddresses } from './auth.mjs';
 import { startTask, budgetState, cancelTask, listResearchOutputs } from './orchestrator.mjs';
@@ -208,6 +209,14 @@ app.get('/api/context', (req, res) => {
 app.post('/api/context/source', (req, res) => {
   const { name, source } = req.body || {};
   if (!name || !source?.type) return res.status(400).json({ error: '缺少 name/source.type' });
+  // raw 源（知识库原文/书）：挂载时就解析+锁 kb/raw/ 子树，存归一后的相对路径（防越界、防死链）。
+  if (source.type === 'raw') {
+    if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
+    const hit = resolveRawPath(source.rel);
+    if (!hit) return res.status(400).json({ error: `kb/raw/ 下找不到「${source.rel}」（或路径越界，只能挂 kb/raw/ 内的文件）` });
+    source.rel = hit.rel;                                  // 归一到磁盘真实相对路径
+    if (!source.label) source.label = hit.rel.split('/').pop();
+  }
   // 实体源：挂载时就解析/守门，别等装配时静默失败。
   if (source.type === 'entity' || source.type === 'entity-all') {
     if (!ENTITY_TYPES.includes(source.entityType)) return res.status(400).json({ error: 'entityType 须为 ' + ENTITY_TYPES.join('/') });
@@ -248,6 +257,12 @@ app.patch('/api/context/source', (req, res) => {
 app.get('/api/kb/entities', (req, res) => {
   if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
   res.json(listEntities());
+});
+// 知识库原文清单（「+ 挂 raw/书」UI 选单）：扫 kb/raw/，NFC 归一、剔簿记/媒体；q=按路径子串过滤。
+app.get('/api/kb/raw', (req, res) => {
+  if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
+  const q = (req.query.q || '').toString();
+  res.json(listRawFiles(q));
 });
 app.delete('/api/context/source', (req, res) => {
   const { name, id } = req.body || {};

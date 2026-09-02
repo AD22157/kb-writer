@@ -43,6 +43,10 @@ export const CONFIG = {
   ENTITY_INLINE_LIMIT: Number(process.env.KB_WRITER_ENTITY_LIMIT || 32000),
   //   entity-all mode=full 的整类总字符上限（实测：产品/人 ≤40K 可整挂；公司 15 页 ~200K 会打爆→拒绝提示用 index）
   ENTITY_ALL_FULL_LIMIT: Number(process.env.KB_WRITER_ENTITY_ALL_LIMIT || 40000),
+  //   raw/书 源（挂 kb/raw/ 具体原文，全文注入）单文件 inline 上限：书/长文比实体页大得多，给足；
+  //   超限截断带清晰尾注（绝不静默截）。整本 IPO 招股书/年报（几十万~上百万字符）必然超限，会明示"仅前 N 字"。
+  //   多本大部头同时挂会打爆上下文——每份都超限时提示主人调高本值(KB_WRITER_RAW_INLINE_LIMIT)或少挂几份。
+  RAW_INLINE_LIMIT: Number(process.env.KB_WRITER_RAW_INLINE_LIMIT || 120000),
   // DeepSeek 调研工具循环：最多工具轮数（防空转烧钱/超时）
   DS_MAX_TOOL_ROUNDS: Number(process.env.KB_WRITER_DS_MAX_ROUNDS || 12),
   // 文档工作记忆：轮末抽取开关 + 抽取模型（便宜档；默认 deepseek 直连，失败回退 FAST_MODEL=fable，绝不用 opus）
