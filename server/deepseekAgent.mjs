@@ -2,17 +2,24 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { CONFIG } from './config.mjs';
 import { deepseekKey } from './providers.mjs';
+import { feishuRead } from './larkRead.mjs';
 
 // DeepSeek 也能调研：后端 agentic 工具循环。
 //   DeepSeek 支持 function-calling → 后端把工具定义发给它 → 它只发"工具调用意图" →
 //   **后端替它执行**（可信 node 代码，边界写死）→ 结果喂回 → 循环到出结论。
 //
-// 固定安全工具集（只这四个，后端亲手实现）：
-//   · kb_read     只读 kb/entities + kb/dimensions（NFC 逐段解析，拒 ..、拒库外路径）
-//   · web_search  网页搜索（固定搜索源，只发查询词、收摘要片段）
-//   · web_fetch   GET-only + 域名白名单 = CONFIG.RESEARCH_DOMAINS（与 claude research 档同一份，跳转也须在白名单内）
-//   · reddit      arctic-shift 存档 API（QS-reddit 的 URL 规律；reddit.com 直连不通）
+// 固定安全工具集（后端亲手实现，边界写死）：
+//   · kb_read      只读 kb/entities + kb/dimensions（NFC 逐段解析，拒 ..、拒库外路径）
+//   · web_search   网页搜索（固定搜索源，只发查询词、收摘要片段）
+//   · web_fetch    GET-only + 域名白名单 = CONFIG.RESEARCH_DOMAINS（与 claude research 档同一份，跳转也须在白名单内）
+//   · reddit       arctic-shift 存档 API（QS-reddit 的 URL 规律；reddit.com 直连不通）
+//   · feishu_read  只读飞书/Lark 链接（走 lark-cli 用户身份；host 白名单 + 只读子命令 + 清 OPENCLAW_* env，
+//                  实现见 larkRead.mjs）。web_fetch 读不了飞书（要鉴权、非可 GET 的网页），这条补上。
 // 不给 write、不给 shell、不给任意 URL。DeepSeek 全程碰不到 OS——提示注入至多让它调白名单内工具，无外泄口。
+//
+// TODO(model-agnostic)：让 opus/fable 与 deepseek-批改/补写（无工具的直连补全）也能读飞书链接，正解是在
+//   contextAssembler 装配上下文时把草稿/选段里的飞书链接内联成快照。那要动 contextAssembler/server（本次并行 agent 在改），
+//   本次先只把 DeepSeek 工具循环这条修透。
 
 const nfc = (s) => String(s).normalize('NFC');
 
@@ -160,6 +167,7 @@ export const DS_TOOLS = [
   { type: 'function', function: { name: 'web_search', description: '网页搜索，返回 [{title,url,snippet}]。适合先找线索，再用 web_fetch 读白名单内的原文。', parameters: { type: 'object', properties: { query: { type: 'string' }, count: { type: 'number', description: '结果数，默认 8，最多 10' } }, required: ['query'] } } },
   { type: 'function', function: { name: 'web_fetch', description: '抓取一个网页正文（GET-only）。只允许研究档域名白名单，白名单外会被拒绝——被拒后不要对同一个域反复试，换源。', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } },
   { type: 'function', function: { name: 'reddit', description: 'Reddit 检索（走 arctic-shift 存档 API；reddit.com 直连不通，一律用本工具）。op=search_posts 搜帖 / search_comments 搜评论 / post_comments 取某帖全部评论。关键词搜索必须搭配 subreddit（无全站搜），母婴常用：NewParents、beyondthebump、Mommit、BabyBumps、breastfeeding、daddit——逐个搜。', parameters: { type: 'object', properties: { op: { type: 'string', enum: ['search_posts', 'search_comments', 'post_comments'] }, subreddit: { type: 'string', description: '必填（除 post_comments）。如 NewParents、beyondthebump、Mommit' }, query: { type: 'string', description: '关键词' }, link_id: { type: 'string', description: 'post_comments 用：帖子 id' }, after: { type: 'string', description: 'YYYY-MM-DD 起始日期' }, limit: { type: 'number', description: '默认 15，最多 25' } }, required: ['op'] } } },
+  { type: 'function', function: { name: 'feishu_read', description: '读取一个飞书/Lark 链接的内容当作上下文（只读，走已授权的用户身份）。**只要任务/草稿正文/选段/上下文里出现飞书链接（feishu.cn / larksuite.com），先用本工具把它读进来再作答，绝不回避说“链接内容未提供”。** 支持：drive 文件夹（会列出整个目录清单并展开读前若干篇 docx/表格）、docx/wiki 文档、电子表格。文件夹很大时只展开前 N 篇；要读其中某一篇的全文，就对那篇文档自己的飞书链接再调一次本工具。多个链接逐个读。', parameters: { type: 'object', properties: { url: { type: 'string', description: '完整飞书链接，如 https://xxx.feishu.cn/drive/folder/<token> 或 /docx/<token> 或 /sheets/<token>' }, max_docs: { type: 'number', description: '文件夹模式最多展开几篇文档，默认 8，最多 20' } }, required: ['url'] } } },
 ];
 
 async function execTool(name, args, deadline) {
@@ -170,7 +178,8 @@ async function execTool(name, args, deadline) {
     if (name === 'web_search') return await toolWebSearch(args, ctrl.signal);
     if (name === 'web_fetch') return await toolWebFetch(args, ctrl.signal);
     if (name === 'reddit') return await toolReddit(args, ctrl.signal);
-    return `错误：未知工具 ${name}（只有 kb_read / web_search / web_fetch / reddit）`;
+    if (name === 'feishu_read') return await feishuRead(args, ctrl.signal);
+    return `错误：未知工具 ${name}（只有 kb_read / web_search / web_fetch / reddit / feishu_read）`;
   } catch (e) {
     return `工具执行失败：${String(e.message || e)}`;
   } finally { clearTimeout(t); }
