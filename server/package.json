@@ -1,0 +1,15 @@
+{
+  "name": "kb-writer-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "kb-writer 写作台后端：壳本机 claude(warm 会话) + 存草稿到 kb/writing + 复用 QS-写作 发布器",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "cors": "2.8.5",
+    "express": "4.21.2"
+  }
+}

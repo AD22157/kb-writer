@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.qk.kb-writer</string>
+
+  <!-- 顶层进程 = homebrew python3.12 垫片，subprocess 拉起 node server.mjs。
+       为什么不直接 node：见 ref_launchd_nas_tcc —— launchd 下网络卷(NAS)授权按二进制给，
+       proven 范本用 python3.12 当责任进程，子进程(node 及其 claude 子进程)继承授权，读写 NAS 不假绿灯。 -->
+  <key>ProgramArguments</key><array>
+    <string>/opt/homebrew/opt/python@3.12/bin/python3.12</string>
+    <string>-c</string>
+    <string>import subprocess,sys; sys.exit(subprocess.run([sys.argv[1], sys.argv[2]]).returncode)</string>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/qqkk/Documents/Playground/kb-writer/server/server.mjs</string>
+  </array>
+
+  <key>WorkingDirectory</key><string>/Users/qqkk/Documents/Playground/kb-writer/server</string>
+
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/Users/qqkk/.local/bin</string>
+    <key>KB_WRITER_PORT</key><string>4177</string>
+    <!-- 同时绑 localhost(本机) + mini 的 Tailscale tailnet IP(多端)，绝不绑 0.0.0.0，公司 LAN 扫不到。
+         tailnet IP 变了就改这里（tailscale ip -4 查）。 -->
+    <key>KB_WRITER_BIND</key><string>127.0.0.1,100.97.25.1</string>
+  </dict>
+
+  <!-- 常驻 + kill 后自愈 -->
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>ProcessType</key><string>Interactive</string>
+
+  <key>StandardOutPath</key><string>/Users/qqkk/.kb-collector/kb-writer.log</string>
+  <key>StandardErrorPath</key><string>/Users/qqkk/.kb-collector/kb-writer.log</string>
+</dict></plist>

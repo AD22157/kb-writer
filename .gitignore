@@ -1,0 +1,12 @@
+node_modules/
+*/node_modules/
+dist/
+web/dist/
+.venv/
+*.log
+.DS_Store
+# 凭据绝不进 git
+*.token
+*.key
+.env
+.env.*
