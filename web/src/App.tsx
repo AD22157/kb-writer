@@ -458,6 +458,17 @@ export default function App() {
     try { const r = await API.snapshotSource(name, s.id, model); setBasket(r.basket); setStatusLine('快照已钉：' + (r.snapshotAt || '')); }
     catch (e: any) { setStatusLine('快照失败：' + e.message); }
   };
+  const addFeishu = async () => {
+    const url = prompt('飞书链接（文档 / 表格 / 知识库文件夹，*.feishu.cn）——挂上会用你的飞书身份读一次内容、钉成快照，供所有模型引用');
+    if (!url || !url.trim()) return;
+    setStatusLine('读取飞书内容中（用你的身份，文件夹可能要几十秒）…');
+    try {
+      const b = await API.addSource(name, { type: 'feishu', ref: url.trim(), mode: 'snapshot' });
+      setBasket(b);
+      const s = b.sources.find((x: any) => x.type === 'feishu' && x.ref === url.trim());
+      setStatusLine(s?.snapshotError ? '飞书已挂但读取失败：' + s.snapshotError + '（可在源列表“重钉快照”重试）' : '飞书已读入并钉为快照 ✓');
+    } catch (e: any) { setStatusLine(''); setErrorMsg('挂飞书失败：' + (e.message || e)); }
+  };
 
   // ---- 多 agent 编排（次要助手；补写产出要过审再落笔）----
   const openAgents = async () => { setShowAgents(true); setResearchHist(null); if (name) { try { setTaskBudget(await API.getTasks(name)); } catch { /* noop */ } loadHistory(); } };
@@ -817,7 +828,8 @@ export default function App() {
                   {s.path && <span className="q">{s.path}</span>}
                   {s.rel && <span className="q">kb/raw/{s.rel}</span>}
                   {s.snapshotAt && <span className="q">钉于 {new Date(s.snapshotAt).toLocaleString()}</span>}
-                  {s.type === 'api' && <button onClick={() => snapshot(s)}>钉快照</button>}
+                  {(s as any).snapshotError && <span className="q" style={{ color: '#c0392b' }}>读取失败：{(s as any).snapshotError}</span>}
+                  {(s.type === 'api' || s.type === 'feishu') && <button onClick={() => snapshot(s)}>{s.snapshot ? '重钉快照' : '钉快照'}</button>}
                   {s.type !== 'kb' && <button onClick={() => delSource(s)}>删</button>}
                 </div>
                 {s.snapshot && <pre className="snap">{s.snapshot.slice(0, 500)}{s.snapshot.length > 500 ? '…' : ''}</pre>}
@@ -835,6 +847,7 @@ export default function App() {
             <div className="add-src">
               <button onClick={openEntityPicker} disabled={!name} title="把 公司/人/产品 实体页（L2 事实）或维度（L3）挂进上下文">+ 挂实体</button>
               <button onClick={openRawPicker} disabled={!name} title="从 kb/raw/ 选具体原文（书/长文/文档）挂进上下文，全文注入">+ 挂 raw/书</button>
+              <button onClick={addFeishu} disabled={!name} title="挂一个飞书链接（文档/表格/知识库文件夹）——用你的飞书身份读一次、钉成快照，所有模型都能引用">+ 挂飞书</button>
               <button onClick={addApi} disabled={!name}>+ 挂 API（papablic-data）</button>
               <button onClick={addFile} disabled={!name} title="挂 mini 本机已有文件的路径">+ 挂 mini 本机文件</button>
             </div>

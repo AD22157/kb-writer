@@ -62,7 +62,11 @@ export function addSource(name, src) {
   if (src.type === 'file') clean.path = src.path;
   if (src.type === 'raw') { clean.rel = src.rel; clean.mode = 'snapshot'; }   // 知识库原文（书/长文），存相对路径，装配时再解析
   if (src.type === 'api') { clean.skill = src.skill || 'papablic-data'; clean.query = src.query || ''; }
-  if (src.type === 'web' || src.type === 'feishu') clean.ref = src.ref || '';
+  if (src.type === 'web' || src.type === 'feishu') {
+    clean.ref = src.ref || '';
+    if (src.snapshot) { clean.snapshot = src.snapshot; clean.snapshotAt = src.snapshotAt; clean.mode = 'snapshot'; }  // 飞书挂载时已读的快照
+    if (src.snapshotError) clean.snapshotError = src.snapshotError;                                                   // 读取失败也登记，前端可重钉
+  }
   if (src.type === 'entity') {
     clean.entityType = src.entityType; clean.entity = src.entity;
     clean.mode = src.mode === 'pointer' ? 'pointer' : 'snapshot';

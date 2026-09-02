@@ -6,8 +6,11 @@ import {
 } from './contextStore.mjs';
 import { oneShot } from './claudeSession.mjs';
 import { skillMeta } from './skillsRegistry.mjs';
+import { feishuRead } from './larkRead.mjs';
 import { inlineBinaryText, PDF_INLINE_LIMIT, isPdfPath } from './fileExtract.mjs';
 import { buildMemoryBlock } from './memoryStore.mjs';
+
+const FEISHU_INLINE_LIMIT = 20000;  // 飞书快照注入上限（folder 读约 21K，单文档 ≤16K）
 
 // 上下文装配器：批改/提问前，把篮子里"启用"的源汇总成一段上下文文本，
 // 并决定这个会话的安全档位 kind：'write'（默认，禁 Bash/网络）或 'api'（有 live API 源→放行网关只读 client）。
@@ -183,9 +186,25 @@ export function assemble(name, { agentic = true, kbTool = false } = {}) {
       }
       continue;
     }
-    if (s.type === 'web' || s.type === 'feishu') {
-      // 插槽：后续接 lark skill / WebFetch。Phase 1 只登记，不实拉。
-      parts.push(`### ${s.type === 'feishu' ? '飞书' : '网页'} 源（登记，Phase 1 未实拉）：${s.label} ${s.ref || ''}`);
+    if (s.type === 'feishu') {
+      if (s.snapshot) {
+        const snap = String(s.snapshot);
+        const cut = snap.length > FEISHU_INLINE_LIMIT;
+        const tail = cut ? `\n…（快照全长 ${snap.length} 字，仅注入前 ${FEISHU_INLINE_LIMIT} 字${agentic ? '；要更全可用 feishu_read 单独读其中某篇文档' : '；涉及未注入处标 🟡 待核'}）` : '';
+        parts.push(`### 飞书源（钉于 ${s.snapshotAt || '?'}）：${s.label}\n${s.ref || ''}\n\`\`\`\n${cut ? snap.slice(0, FEISHU_INLINE_LIMIT) : snap}${tail}\n\`\`\``);
+        used.push({ id: s.id, label: s.label, mode: 'snapshot', type: 'feishu' });
+      } else if (agentic) {
+        parts.push(`### 飞书源（未钉快照，可现读）：${s.label}\n${s.ref || ''}\n涉及本源时，用 feishu_read 工具（或 lark-doc / lark-drive skill）现读此链接再引用。${s.snapshotError ? '（上次自动读取失败：' + s.snapshotError + '）' : ''}`);
+        used.push({ id: s.id, label: s.label, mode: 'live', type: 'feishu' });
+      } else {
+        parts.push(`### 飞书源（未读到内容）：${s.label}\n${s.ref || ''}\n${s.snapshotError ? '自动读取失败：' + s.snapshotError + '（可在挂载处重钉快照，或检查 lark 身份/权限）' : '尚未拉取快照'}；当前模型无工具读不了它——涉及此源内容一律标 🟡 待核，别猜。`);
+        used.push({ id: s.id, label: s.label, mode: 'snapshot(空)', type: 'feishu' });
+      }
+      continue;
+    }
+    if (s.type === 'web') {
+      // 插槽：WebFetch 未接。Phase 1 只登记，不实拉。
+      parts.push(`### 网页源（登记，未实拉）：${s.label} ${s.ref || ''}`);
       used.push({ id: s.id, label: s.label, mode: s.mode, type: s.type });
       continue;
     }
@@ -228,5 +247,13 @@ export function assemble(name, { agentic = true, kbTool = false } = {}) {
 export async function snapshotApiSource(skill, query, model) {
   const prompt = `请用 ${skill} skill 拉一次数据并把结果原样整理成一段可引用的文本（含具体数字、口径、日期范围、数据源）。查询：${query}\n\n只输出这段可 pin 的数据文本，不要额外解释。若 skill 未装或拉取失败，直说失败原因。`;
   const { text } = await oneShot(prompt, { model, kind: 'api' });
+  return text.trim();
+}
+
+// 钉一份飞书快照：走 larkRead（锁死只读 + 用户身份 + host 白名单 + 清 OPENCLAW_* env）。
+// feishuRead 永远返回字符串（失败也是字符串，前缀“拒绝/无法读取”“读取飞书失败”）——据前缀判失败并抛出，让调用方登记 snapshotError。
+export async function snapshotFeishuSource(url, { maxDocs = 10 } = {}) {
+  const text = await feishuRead({ url, max_docs: maxDocs });
+  if (/^(拒绝\/无法读取：|读取飞书失败)/.test(text)) throw new Error(text);
   return text.trim();
 }

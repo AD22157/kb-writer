@@ -10,7 +10,7 @@ import {
   listDimensions, readDimension, writeDimension,
 } from './kbStore.mjs';
 import { getSession, shutdownAll } from './claudeSession.mjs';
-import { assemble, snapshotApiSource } from './contextAssembler.mjs';
+import { assemble, snapshotApiSource, snapshotFeishuSource } from './contextAssembler.mjs';
 import {
   readBasket, addSource, updateSource, removeSource, writeBasket, saveAttachment,
   ENTITY_TYPES, listEntities, resolveEntityPage, classTotalChars,
@@ -206,7 +206,7 @@ app.get('/api/context', (req, res) => {
   if (!name) return res.status(400).json({ error: '缺少 name' });
   res.json(readBasket(name));
 });
-app.post('/api/context/source', (req, res) => {
+app.post('/api/context/source', async (req, res) => {
   const { name, source } = req.body || {};
   if (!name || !source?.type) return res.status(400).json({ error: '缺少 name/source.type' });
   // raw 源（知识库原文/书）：挂载时就解析+锁 kb/raw/ 子树，存归一后的相对路径（防越界、防死链）。
@@ -234,6 +234,20 @@ app.post('/api/context/source', (req, res) => {
           return res.status(400).json({ error: `整类「${source.entityType}」共约 ${Math.round(total / 1000)}K 字符，超过 full 上限 ${Math.round(CONFIG.ENTITY_ALL_FULL_LIMIT / 1000)}K 会打爆上下文——请用 index 模式（注入该类索引表＋覆盖指令，涉及哪家读哪页）` });
         }
       }
+    }
+  }
+  // 飞书源：挂载时就用用户身份读一次、钉成快照（→ 进 contextBlock，对所有模型/所有路径生效）。读失败也登记、标错，前端可重钉。
+  if (source.type === 'feishu') {
+    if (!/^https?:\/\/[^/]+\.(feishu\.cn|larksuite\.com)\//i.test(source.ref || '')) {
+      return res.status(400).json({ error: '飞书源需要一个完整的 *.feishu.cn / *.larksuite.com 链接' });
+    }
+    if (!source.label) source.label = '飞书：' + source.ref.replace(/^https?:\/\//, '').slice(0, 48);
+    try {
+      source.snapshot = await snapshotFeishuSource(source.ref);
+      source.snapshotAt = new Date().toISOString();
+      source.mode = 'snapshot';
+    } catch (e) {
+      source.snapshotError = String(e.message || e);
     }
   }
   res.json(addSource(name, source));
@@ -315,10 +329,10 @@ app.post('/api/context/snapshot', async (req, res) => {
   if (!name || !id) return res.status(400).json({ error: '缺少 name/id' });
   const b = readBasket(name);
   const s = b.sources.find((x) => x.id === id);
-  if (!s || s.type !== 'api') return res.status(400).json({ error: '不是 api 源' });
+  if (!s || (s.type !== 'api' && s.type !== 'feishu')) return res.status(400).json({ error: '只能给 api / feishu 源钉快照' });
   try {
-    const text = await snapshotApiSource(s.skill, s.query, model);
-    s.mode = 'snapshot'; s.snapshot = text; s.snapshotAt = new Date().toISOString();
+    const text = s.type === 'feishu' ? await snapshotFeishuSource(s.ref) : await snapshotApiSource(s.skill, s.query, model);
+    s.mode = 'snapshot'; s.snapshot = text; s.snapshotAt = new Date().toISOString(); delete s.snapshotError;
     writeBasket(name, b);
     res.json({ ok: true, snapshot: text, snapshotAt: s.snapshotAt, basket: b });
   } catch (e) {
