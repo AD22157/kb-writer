@@ -45,6 +45,9 @@ export const CONFIG = {
   ENTITY_ALL_FULL_LIMIT: Number(process.env.KB_WRITER_ENTITY_ALL_LIMIT || 40000),
   // DeepSeek 调研工具循环：最多工具轮数（防空转烧钱/超时）
   DS_MAX_TOOL_ROUNDS: Number(process.env.KB_WRITER_DS_MAX_ROUNDS || 12),
+  // 文档工作记忆：轮末抽取开关 + 抽取模型（便宜档；默认 deepseek 直连，失败回退 FAST_MODEL=fable，绝不用 opus）
+  MEMORY_EXTRACT: process.env.KB_WRITER_MEMORY_EXTRACT !== '0',
+  MEMORY_EXTRACT_MODEL: process.env.KB_WRITER_MEMORY_MODEL || 'deepseek-chat',
 };
 
 // DeepSeek（非 Claude provider）：key 引用机器上已有的位置（V3 的 .env.local），不复制明文到新地方。

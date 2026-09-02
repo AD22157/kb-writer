@@ -13,6 +13,14 @@ const MODELS = [
 // deepseek 是纯补全、无工具（与后端 providers.isAgentic 同口径）
 const isAgenticModel = (m: string) => !String(m).startsWith('deepseek');
 
+// 本文记忆的四个主人段（权威区；「agent 记的」提案区单独渲染）
+const MEM_SECTIONS: { key: 'rulings' | 'established' | 'preferences' | 'open'; title: string; hint: string }[] = [
+  { key: 'rulings', title: '主人的裁决/纠正', hint: '最高权威·逐字。任何模型不得推翻、不得再标红。轮末抽取写不到这段——只有你能改。' },
+  { key: 'established', title: '已确立·别重复提', hint: '已核过/已接受的结论；换个模型也不再标同一处。' },
+  { key: 'preferences', title: '本文偏好/方向', hint: '语气、重点、你在意什么。' },
+  { key: 'open', title: '悬而未决', hint: '开着的线头，agent 可主动跟进。' },
+];
+
 // 选区回显：压平空白，长选区留首尾两截，让用户两头都能对上是不是那段
 function selPreview(s: string): string {
   const one = s.replace(/\s+/g, ' ').trim();
@@ -88,6 +96,16 @@ export default function App() {
   const [showEntities, setShowEntities] = useState(false);
   const [entType, setEntType] = useState<'公司' | '人' | '产品' | '维度L3'>('公司');
   const [kbEnts, setKbEnts] = useState<Record<string, API.KbEntity[]> | null>(null);
+  // 本文工作记忆（.memory.md sidecar；跨模型持久。主人区=权威，agent 记的=提案）
+  const [showMemory, setShowMemory] = useState(false);
+  const [memory, setMemory] = useState<API.MemorySections | null>(null);
+  const [memCount, setMemCount] = useState(0);
+  const [memDirty, setMemDirty] = useState(false);
+  const [memSaving, setMemSaving] = useState(false);
+  const [memAdd, setMemAdd] = useState<Record<string, string>>({});
+  const memRef = useRef<API.MemorySections | null>(null);
+  const memDirtyRef = useRef(false);
+  const memSaveTimer = useRef<number | undefined>(undefined);
   // 技能挂载 + 动作技能
   const [allSkills, setAllSkills] = useState<API.InstalledSkill[] | null>(null);
   const [showAllSkills, setShowAllSkills] = useState(false);
@@ -165,6 +183,8 @@ export default function App() {
     loadingRef.current = true;
     setDocType('draft'); docTypeRef.current = 'draft';
     setName(n); nameRef.current = n;
+    memRef.current = null; memDirtyRef.current = false; setMemory(null); setMemCount(0); setMemDirty(false);
+    loadMemory(n, true);
     let md = d.markdown || '';
     // 本地恢复：若 localStorage 有一份与服务器不同的未保存编辑 → 提示恢复
     const local = readLocal(n);
@@ -215,6 +235,8 @@ export default function App() {
     loadingRef.current = true;
     setDocType('dim'); docTypeRef.current = 'dim';
     setName(n); nameRef.current = n;
+    memRef.current = null; memDirtyRef.current = false; setMemory(null); setMemCount(0); setMemDirty(false);
+    loadMemory(n, true);
     // 本地恢复：localStorage 里有一份不同的未保存编辑 → 提示恢复（与草稿同一套）
     const local = readLocal(n);
     let unsaved = false;
@@ -310,6 +332,9 @@ export default function App() {
       else if (e.type === 'error') { setStatusLine(''); setErrorMsg(e.message); }
     }).catch((err) => { setStatusLine(''); setErrorMsg(err.message === 'unauthorized' ? 'token 失效，请重新进入' : ('连接中断：' + err.message + '（可重试）')); });
     setStreaming(false);
+    // 轮末抽取在后端异步跑（廉价模型），延迟刷新记忆计数/面板（正在编辑记忆时不覆盖）
+    const n = nameRef.current;
+    window.setTimeout(() => { if (nameRef.current === n) loadMemory(n); }, 30000);
   };
 
   const runReview = (quick = false) => stream('/api/review', { markdown: mdRef.current, quick });
@@ -444,6 +469,57 @@ export default function App() {
   };
   const loadHistory = async () => { if (!name) return; try { setResearchHist((await API.getResearch(name)).outputs); } catch { setResearchHist([]); } };
 
+  // ---- 本文工作记忆 ----
+  const emptyMem = (): API.MemorySections => ({ rulings: [], established: [], preferences: [], open: [], proposals: [] });
+  const memTotal = (s: API.MemorySections) => s.rulings.length + s.established.length + s.preferences.length + s.open.length + s.proposals.length;
+  const loadMemory = useCallback(async (n: string, force = false) => {
+    if (!n) return;
+    try {
+      const m = await API.getMemory(n);
+      if (nameRef.current !== n) return;                       // 已切换文档，丢弃
+      if (memRef.current && memDirtyRef.current && !force) return; // 本地有未存编辑，别覆盖
+      memRef.current = m.sections; setMemory(m.sections); setMemCount(memTotal(m.sections));
+      memDirtyRef.current = false; setMemDirty(false);
+    } catch { /* 记忆读不到不阻断写作 */ }
+  }, []);
+  const saveMemory = async () => {
+    if (!nameRef.current || !memRef.current) return;
+    setMemSaving(true);
+    try { await API.putMemory(nameRef.current, memRef.current); memDirtyRef.current = false; setMemDirty(false); setMemCount(memTotal(memRef.current)); }
+    catch (e: any) { setErrorMsg('记忆保存失败：' + (e.message || e)); }
+    setMemSaving(false);
+  };
+  // 一切改动走这里：更新本地 + debounce 自动保存（PUT /api/memory，服务端可信落盘）
+  const mutateMemory = (fn: (s: API.MemorySections) => API.MemorySections) => {
+    const next = fn(memRef.current || emptyMem());
+    memRef.current = next; setMemory(next); memDirtyRef.current = true; setMemDirty(true); setMemCount(memTotal(next));
+    window.clearTimeout(memSaveTimer.current);
+    memSaveTimer.current = window.setTimeout(saveMemory, 1200);
+  };
+  const memEdit = (sec: keyof API.MemorySections, i: number, v: string) =>
+    mutateMemory((s) => ({ ...s, [sec]: s[sec].map((x, j) => (j === i ? v : x)) }));
+  const memDel = (sec: keyof API.MemorySections, i: number) =>
+    mutateMemory((s) => ({ ...s, [sec]: s[sec].filter((_, j) => j !== i) }));
+  const memAddItem = (sec: keyof API.MemorySections) => {
+    const v = (memAdd[sec] || '').trim();
+    if (!v) return;
+    mutateMemory((s) => ({ ...s, [sec]: [...s[sec], v] }));
+    setMemAdd((a) => ({ ...a, [sec]: '' }));
+  };
+  // 采纳提案：按 tag 升入对应主人段（裁决→逐字锁进裁决段），并从提案区移除
+  const adoptProposal = (i: number) => {
+    const raw = (memRef.current || emptyMem()).proposals[i];
+    if (raw == null) return;
+    const m = raw.match(/^\[([^\]]+)\]\s*([\s\S]*)$/);
+    const tag = m ? m[1] : '';
+    let text = (m ? m[2] : raw).replace(/（\d{4}-\d{2}-\d{2}·[^）]*）\s*$/, '').trim();
+    const target: keyof API.MemorySections = tag.includes('裁决') ? 'rulings'
+      : tag.includes('偏好') ? 'preferences' : tag.includes('线头') ? 'open' : 'established';
+    if (target === 'rulings') { const mm = text.match(/^主人说：[“"]?([\s\S]*?)[”"]?$/); if (mm) text = mm[1]; }
+    mutateMemory((s) => ({ ...s, [target]: [...s[target], text], proposals: s.proposals.filter((_, j) => j !== i) }));
+  };
+  const openMemory = () => { setShowMemory(true); if (name) loadMemory(name, true); };
+
   // ---- 技能挂载 ----
   const openSkillPicker = async () => {
     setShowAllSkills(true);
@@ -530,6 +606,12 @@ export default function App() {
         <button disabled={docType === 'dim'} onClick={() => { setDrawer(true); refreshBasket(); if (!allSkills) API.getInstalledSkills().then(setAllSkills).catch(() => setAllSkills([])); }}>上下文 ({basket.sources.filter((s) => s.enabled).length}){mountedSkills.length > 0 ? ` ·技${mountedSkills.length}` : ''}</button>
         <button className={showAgents ? 'on' : ''} onClick={() => (showAgents ? setShowAgents(false) : openAgents())} title="次要助手：并行派 补写/调研 子任务，产出要过审才落笔">多 agent 助手</button>
         {name && <button onClick={openVersions} title="NAS 回收站里每次自动存的历史版本，可恢复成新文件">版本历史{docType === 'dim' ? '（L3）' : ''}</button>}
+        {name && (
+          <button className={showMemory ? 'on' : ''} onClick={() => (showMemory ? setShowMemory(false) : openMemory())}
+            title="本文工作记忆（跨模型持久）：你的裁决与已确立的结论，每次 agent 调用都注入——换模型/重启不丢">
+            🧠 记忆{memCount > 0 ? ` (${memCount})` : ''}
+          </button>
+        )}
       </header>
 
       <div className="body">
@@ -875,6 +957,61 @@ export default function App() {
                 </div>
               </div>
             ))}
+          </aside>
+        </div>
+      )}
+
+      {showMemory && (
+        <div className="drawer-mask" onClick={() => setShowMemory(false)}>
+          <aside className="drawer" onClick={(e) => e.stopPropagation()}>
+            <div className="drawer-head">
+              <b>🧠 本文记忆 · {name || '（未选文档）'}</b>
+              <span>
+                <span className="muted" style={{ marginRight: 8 }}>{memSaving ? '保存中…' : memDirty ? '● 未保存' : '已保存'}</span>
+                <button onClick={() => loadMemory(name, true)} title="重新读 NAS 上的 .memory.md（每轮结束后抽取器可能追加了提案）">刷新</button>
+                <button onClick={() => setShowMemory(false)}>×</button>
+              </span>
+            </div>
+            <p className="muted">
+              跨模型持久记忆（存 NAS <code>{name}.memory.md</code>）：每次批改/动作/子任务、每个模型（opus/fable/DeepSeek）都会带上——换模型/重启不忘。
+              前四段是<b>你的（权威）</b>，只有这个面板能改；「agent 记的」是每轮结束后抽取的<b>提案</b>，你采纳才升级、可随手删。改动 1.2s 后自动保存。
+            </p>
+            {memory === null && <p className="muted">读取中…</p>}
+            {memory && MEM_SECTIONS.map(({ key, title, hint }) => (
+              <div key={key} className={`src memsec ${key === 'rulings' ? 'authority' : ''}`}>
+                <div><b>{title}</b> <span className="chip">{key === 'rulings' ? '主人说的·权威' : '主人确认'}</span></div>
+                <div className="muted" style={{ fontSize: '12px' }}>{hint}</div>
+                {memory[key].map((t, i) => (
+                  <div key={`${key}-${i}`} className="mem-item">
+                    <input value={t} onChange={(e) => memEdit(key, i, e.target.value)} />
+                    <button onClick={() => memDel(key, i)} title="删掉这条">删</button>
+                  </div>
+                ))}
+                <div className="mem-item add">
+                  <input placeholder={`＋ 添一条${key === 'rulings' ? '裁决（逐字写你的原话）' : ''}…`} value={memAdd[key] || ''}
+                    onChange={(e) => setMemAdd((a) => ({ ...a, [key]: e.target.value }))}
+                    onKeyDown={(e) => { if (e.key === 'Enter') memAddItem(key); }} />
+                  <button onClick={() => memAddItem(key)} disabled={!(memAdd[key] || '').trim()}>加</button>
+                </div>
+              </div>
+            ))}
+            {memory && (
+              <div className="src memsec proposals">
+                <div><b>agent 记的（提案 · 待你确认）</b> <span className="chip">每轮结束后抽取追加</span></div>
+                <div className="muted" style={{ fontSize: '12px' }}>
+                  轮末由后端用便宜模型抽"这轮确立了什么、你纠正了什么"，只进这个区（写不到上面四段）。
+                  「主人原话」条目是逐字引用——采纳会升入裁决段锁定；其余采纳进对应主人段。
+                </div>
+                {memory.proposals.length === 0 && <p className="muted">还没有提案（跑一轮批改/提问后出现）。</p>}
+                {memory.proposals.map((t, i) => (
+                  <div key={`p-${i}`} className="mem-item proposal">
+                    <span className="mem-text">{t}</span>
+                    <button className="primary" onClick={() => adoptProposal(i)} title="升入对应主人段（裁决逐字锁定）">采纳↑</button>
+                    <button onClick={() => memDel('proposals', i)}>删</button>
+                  </div>
+                ))}
+              </div>
+            )}
           </aside>
         </div>
       )}

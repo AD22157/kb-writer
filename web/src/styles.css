@@ -125,3 +125,13 @@ button.on { background: var(--accent2); color: #fff; border-color: var(--accent2
 .drawer.wide { width: min(720px, 92vw); }
 .action-edit { width: 100%; box-sizing: border-box; font: 13px/1.6 ui-monospace, monospace; padding: 10px; border: 1px solid var(--line, #ccc); border-radius: 8px; resize: vertical; }
 .skills-mount { border-top: 1px dashed var(--line, #ddd); padding-top: 6px; }
+
+/* 本文工作记忆面板：主人区（权威）vs agent 提案区 醒目区分 */
+.memsec.authority { border-color: var(--accent); background: rgba(108,199,154,.07); }
+.memsec.proposals { border-style: dashed; }
+.mem-item { display: flex; align-items: center; gap: 6px; margin: 6px 0; }
+.mem-item input { flex: 1; font-size: 13px; }
+.mem-item.add input { border-style: dashed; }
+.mem-item .mem-text { flex: 1; font-size: 12.5px; line-height: 1.5; }
+.mem-item button { padding: 2px 8px; font-size: 12px; white-space: nowrap; }
+.chip.memory { background: var(--accent); color: #fff; }

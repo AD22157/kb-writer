@@ -7,6 +7,7 @@ import { assemble } from './contextAssembler.mjs';
 import { isAgentic, runCompletion } from './providers.mjs';
 import { runDeepseekResearch } from './deepseekAgent.mjs';
 import { buildNonAgenticSystemPrompt, buildDeepseekResearchSystemPrompt } from './systemPrompt.mjs';
+import { scheduleExtraction } from './memoryExtractor.mjs';
 
 // 文档内多 agent 编排：从一篇文档并行派 N 个"按档 scoped"的子任务。
 //   · 补写(write 档) / 调研(research 档)——各用自己那档 settings+沙箱，进程隔离，不逃档。
@@ -91,6 +92,8 @@ export async function startTask(name, type, instruction, selection, model, onEve
     spentByDoc.set(name, spent(name) + task.cost);
     runningByDoc.get(name)?.delete(id);   // 先出并发计数，再报 budget（否则 running 把自己算进去）
     onEvent({ type: 'done', id, cost: task.cost, scratchPath: task.scratchPath, budget: budgetState(name) });
+    // 轮末记忆抽取：任务指令是主人原话（裁决只能逐字摘自它），产出进提案区
+    scheduleExtraction(name, { label: kind === 'research' ? '调研子任务' : '补写子任务', masterText: instruction, reply: text || out });
   } catch (e) {
     task.status = 'error';
     runningByDoc.get(name)?.delete(id);

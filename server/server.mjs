@@ -20,6 +20,8 @@ import { startTask, budgetState, cancelTask, listResearchOutputs } from './orche
 import { isAgentic, runCompletion } from './providers.mjs';
 import { buildNonAgenticSystemPrompt } from './systemPrompt.mjs';
 import { ensureActionFiles, loadActionBody, readActionSkill, writeActionSkill, ACTION_FILES } from './actionSkills.mjs';
+import { readMemory, writeMemorySections, SECTION_KEYS } from './memoryStore.mjs';
+import { scheduleExtraction } from './memoryExtractor.mjs';
 import { installedSkills } from './skillsRegistry.mjs';
 import { setSkills } from './contextStore.mjs';
 import { extractPdfText, isPdfPath } from './fileExtract.mjs';
@@ -63,35 +65,43 @@ const sseSend = (res, obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 
 // 统一跑一个流式 turn（带上下文装配 + 工具追溯）。
 // 非 agentic 模型（deepseek）：无工具，直连补全，吃装配器快照；调研类能力不可用（诚实边界在 system prompt）。
-async function runTurn(res, { name, model, buildPrompt }) {
+// memoryTurn = { label, masterText }：轮成功结束后触发一次轮末记忆抽取（fire-and-forget，不阻塞响应）。
+async function runTurn(res, { name, model, buildPrompt, memoryTurn }) {
   const agentic = isAgentic(model);
   const { contextBlock, kind, used, skillNames } = assemble(name, { agentic });
   sseInit(res);
   sseSend(res, { type: 'context', used, kind: agentic ? kind : 'completion', skills: skillNames || [] });
   const started = Date.now();
+  let reply = '';
+  let okDone = false;
   try {
     if (!agentic) {
       const { usage } = await runCompletion(
         model,
         { system: buildNonAgenticSystemPrompt(), user: buildPrompt(contextBlock) },
-        (t) => sseSend(res, { type: 'delta', text: t }),
+        (t) => { reply += t; sseSend(res, { type: 'delta', text: t }); },
         { timeoutMs: CONFIG.SEND_TIMEOUT_MS },
       );
+      okDone = true;
       sseSend(res, { type: 'done', ms: Date.now() - started, cost: 0, toolsSeen: [], used, usage, note: 'deepseek 直连（费用极低，未计入预算）' });
     } else {
       const session = getSession(name, model, kind);
       const toolsSeen = [];
-      const { cost } = await session.send(
+      const { cost, text } = await session.send(
         buildPrompt(contextBlock),
-        (t) => sseSend(res, { type: 'delta', text: t }),
+        (t) => { reply += t; sseSend(res, { type: 'delta', text: t }); },
         (toolName) => { toolsSeen.push(toolName); sseSend(res, { type: 'tool', name: toolName }); },
       );
+      if (!reply && text) reply = text;
+      okDone = true;
       sseSend(res, { type: 'done', ms: Date.now() - started, cost, toolsSeen, used });
     }
   } catch (e) {
     sseSend(res, { type: 'error', message: String(e.message || e) });
   }
   res.end();
+  // 轮末记忆抽取（廉价模型、后端可信落盘、只进提案区）——出错轮不抽
+  if (okDone && memoryTurn) scheduleExtraction(name, { ...memoryTurn, reply });
 }
 
 // ---- 草稿 ----
@@ -137,7 +147,11 @@ app.post('/api/review', async (req, res) => {
   if (!name || typeof markdown !== 'string') return res.status(400).json({ error: '缺少 name/markdown' });
   if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
   persistIfDraft(docType, name, markdown);
-  await runTurn(res, { name, model, buildPrompt: (ctx) => reviewPrompt(name, markdown, quick, ctx) + (isDim(docType) ? L3_NOTE : '') });
+  await runTurn(res, {
+    name, model,
+    buildPrompt: (ctx) => reviewPrompt(name, markdown, quick, ctx) + (isDim(docType) ? L3_NOTE : ''),
+    memoryTurn: { label: quick ? '快速核查' : '批改', masterText: '' },
+  });
 });
 
 // ---- 一起写（选段级动作） ----
@@ -149,7 +163,40 @@ app.post('/api/act', async (req, res) => {
   if (['audit', 'revise', 'supplement'].includes(action) && !selection) return res.status(400).json({ error: action + ' 需要 selection' });
   if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
   persistIfDraft(docType, name, markdown);
-  await runTurn(res, { name, model, buildPrompt: (ctx) => actPrompt(action, { name, selection, question, outline, md: markdown }, ctx) + (isDim(docType) ? L3_NOTE : '') });
+  // 主人原话（裁决只能逐字摘自这里）：ask 的问题 / draft 的大纲。选段是草稿文本不算指令。
+  const ACT_ZH = { ask: '选段提问', supplement: '补充', revise: '修正', question: '提问', draft: '起草', audit: '审对不对' };
+  await runTurn(res, {
+    name, model,
+    buildPrompt: (ctx) => actPrompt(action, { name, selection, question, outline, md: markdown }, ctx) + (isDim(docType) ? L3_NOTE : ''),
+    memoryTurn: { label: ACT_ZH[action] || action, masterText: [question, outline].filter(Boolean).join('\n') },
+  });
+});
+
+// ---- 文档工作记忆（<草稿>.memory.md sidecar；跨模型持久）----
+// 主人区（前四段）唯一可写机器路径 = 这条 PUT（token 鉴权 + name 守卫 + 只写 kb/writing 的 .memory.md + 原子写）。
+// 轮末抽取（memoryExtractor）只能 append 到「agent 记的」提案区，代码上碰不到主人区。
+app.get('/api/memory', (req, res) => {
+  const name = (req.query.name || '').toString();
+  if (!name) return res.status(400).json({ error: '缺少 name' });
+  if (/[/\\]/.test(name) || name.includes('..')) return res.status(400).json({ error: 'name 不能含路径分隔符' });
+  if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
+  const m = readMemory(name);
+  res.json({ name, exists: m.exists, sections: m.sections, path: m.path });
+});
+app.put('/api/memory', async (req, res) => {
+  const { name, sections } = req.body || {};
+  if (!name || typeof name !== 'string') return res.status(400).json({ error: '缺少 name' });
+  if (/[/\\]/.test(name) || name.includes('..') || !name.trim()) return res.status(400).json({ error: 'name 不能含路径分隔符' });
+  if (!sections || typeof sections !== 'object' || Array.isArray(sections)) return res.status(400).json({ error: '缺少 sections{}' });
+  for (const k of Object.keys(sections)) {
+    if (!SECTION_KEYS.includes(k)) return res.status(400).json({ error: `未知段 ${k}（须为 ${SECTION_KEYS.join('/')}）` });
+    if (!Array.isArray(sections[k])) return res.status(400).json({ error: `${k} 须为字符串数组` });
+  }
+  if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
+  try {
+    const r = await writeMemorySections(name, sections);
+    res.json({ ok: true, path: r.path, sections: r.sections });
+  } catch (e) { res.status(400).json({ error: String(e.message || e) }); }
 });
 
 // ---- 上下文篮子 ----

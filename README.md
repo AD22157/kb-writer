@@ -136,6 +136,22 @@ cd ~/Documents/Playground/kb-writer/web && npm run dev             # :5173，/ap
 
 ---
 
+## 文档工作记忆（跨模型不忘的关键）
+
+warm 会话只是**单模型**的性能优化——换模型（opus↔fable↔DeepSeek）=新会话=清空。所以每篇文档还有一个**工作记忆 sidecar** `kb/writing/<草稿>.memory.md`（NAS 持久），装配器把它**置于 contextBlock 顶部**注入每一次 agent 调用（批改/动作/子任务、全模型）：知识活在文档里、不活在会话里，换模型不丢。
+
+四段主人区（权威）+ 一段提案区：
+
+| 段 | 谁能写 | 语义 |
+|---|---|---|
+| 主人的裁决/纠正 | **只有你**（顶栏「🧠 记忆」面板 → PUT /api/memory，token 鉴权+路径守卫+原子写） | 最高权威、逐字；任何模型不得推翻/再标红 |
+| 已确立·别重复提 / 本文偏好 / 悬而未决 | 只有你（同上） | 已核过的结论 / 方向 / 线头 |
+| agent 记的（提案·待确认） | 每轮结束后后端触发**廉价抽取**（deepseek 直连，失败回退 fable；绝不 opus），append-only+去重 | 面板里「采纳↑」升入主人段、或删 |
+
+防乱改主人裁决（三道）：① 抽取器代码上只有 appendProposals 一个落盘口，只进提案区，碰不到主人区；② 抽出的"主人裁决"必须逐字对上主人这轮原话（空白归一后子串），对不上就降级成待定提案——模型编不出"主人说过"；③ 注入时提案区明确标"未确认，不得当主人指令"。记忆与挂载 L3 矛盾时以 L3 为准。`context.used` 里可见「本文记忆（主人裁决N·已确立M·agent记K）」。
+
+---
+
 ## 安全边界（能力硬化，防 tailnet 里其他 agent 盗用 + 上下文注入）
 
 主要威胁 = **上下文内容里的提示注入**（从合法使用流进来的，Tailscale 拦不住）。所以 claude 子进程用**真边界**关住，不再 `bypassPermissions`：
@@ -161,6 +177,6 @@ cd ~/Documents/Playground/kb-writer/web && npm run dev             # :5173，/ap
 - 飞书流水账当写作素材源（另一个开关）。
 
 ## 关键文件
-- `server/` — Node 后端：`server.mjs`(路由/SSE) · `claudeSession.mjs`(warm 会话) · `contextAssembler.mjs`/`contextStore.mjs`(上下文层) · `kbStore.mjs`(草稿/NAS/发布) · `auth.mjs`(token) · `systemPrompt.mjs`(QS-写作 方法注入)
+- `server/` — Node 后端：`server.mjs`(路由/SSE) · `claudeSession.mjs`(warm 会话) · `contextAssembler.mjs`/`contextStore.mjs`(上下文层) · `memoryStore.mjs`/`memoryExtractor.mjs`(文档工作记忆) · `kbStore.mjs`(草稿/NAS/发布) · `auth.mjs`(token) · `systemPrompt.mjs`(QS-写作 方法注入)
 - `web/` — Vite+React+TS 前端：`App.tsx` · `Editor.tsx`(Tiptap) · `api.ts`
 - `com.qk.kb-writer.plist` — launchd 常驻（顶层 python3.12 垫片→node，保证 claude 子进程继承 NAS TCC）

@@ -116,6 +116,13 @@ export const getActionSkill = (action: string) => api(`/api/action-skill?action=
 export const putActionSkill = (action: string, content: string) =>
   api('/api/action-skill', { method: 'PUT', body: JSON.stringify({ action, content }) }) as Promise<ActionSkill>;
 
+// ---- 文档工作记忆（<草稿>.memory.md；跨模型持久。主人区只有这条 PUT 能写；抽取只进提案区）----
+export interface MemorySections { rulings: string[]; established: string[]; preferences: string[]; open: string[]; proposals: string[] }
+export interface MemoryDoc { name: string; exists: boolean; sections: MemorySections; path: string }
+export const getMemory = (name: string) => api(`/api/memory?name=${encodeURIComponent(name)}`) as Promise<MemoryDoc>;
+export const putMemory = (name: string, sections: MemorySections) =>
+  api('/api/memory', { method: 'PUT', body: JSON.stringify({ name, sections }) }) as Promise<{ ok: boolean; path: string; sections: MemorySections }>;
+
 // ---- 理解层（kb/dimensions，L3 主人手写区；唯一可写机器路径=这条用户 UI 路由）----
 export interface Dimension { name: string; mtime: number; size: number }
 export const listDimensions = () => api('/api/dimensions').then((r) => r.dimensions as Dimension[]);

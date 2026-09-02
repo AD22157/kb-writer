@@ -64,6 +64,11 @@ const KB_READONLY_SUBTREES = ['dimensions', 'entities', 'raw', '_schema', 'weekl
 // 提权路径：cwd/.claude/settings*.json 会被 --setting-sources project 读进下一次会话，
 // 能给自己加 allow / 关沙箱。精确 deny 这两个文件（不动 .claude/.cc-writes，那是 CC 自己的记账目录）。
 const KB_PROJECT_SETTINGS_DENY = [`${KB_ABS}/.claude/settings.json`, `${KB_ABS}/.claude/settings.local.json`];
+// 控制类 sidecar：agent 不能经 Bash 篡改——`.memory.md` 有最高权威的「主人裁决」段（会被后续照办）、
+// `.context.json` 决定挂了哪些上下文源。它们在 kb/writing(allowWrite)内，但 denyWrite 更具体、覆盖 allow。
+// 合法写入走可信 node 后端(memoryStore/contextStore)，不经沙箱，不受此影响。
+const KB_CONTROL_FILES_DENY = ['*.memory.md', '*.context.json']
+  .flatMap((g) => [`${KB_ABS}/writing/${g}`, `${KB_ABS}/writing/**/${g}`]);
 
 // live-API 会话：额外放行 Skill+Bash 跑网关只读 client。沙箱把 Bash 硬关——
 // 网络只 gateway host、写只 kb/writing、读 deny 敏感目录（网关 token 精确放行给 client）。
@@ -77,7 +82,7 @@ export function apiSessionSettings() {
     abs('.openclaw/secrets/gateway-token'),   // 精确放行这一个密钥文件给 client（绝对路径才稳）
   ], [gatewayHost]);
   // 仅 api 档收紧：kb 树里除 writing 外全部只读（Bash 只有这一档有）。write/research 档不动。
-  sbx.filesystem.denyWrite = [...sbx.filesystem.denyWrite, ...KB_READONLY_SUBTREES, ...KB_PROJECT_SETTINGS_DENY];
+  sbx.filesystem.denyWrite = [...sbx.filesystem.denyWrite, ...KB_READONLY_SUBTREES, ...KB_PROJECT_SETTINGS_DENY, ...KB_CONTROL_FILES_DENY];
   return {
     sandbox: sbx,
     permissions: {
