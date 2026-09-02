@@ -38,6 +38,13 @@ export const CONFIG = {
   TASK_TIMEOUT_WRITE_MS: Number(process.env.KB_WRITER_TASK_TIMEOUT_WRITE_MS || 4 * 60 * 1000),
   // 交互式批改/动作的通用安全网（冷启大库批改可能数分钟，给宽一点，只防真卡死）
   SEND_TIMEOUT_MS: Number(process.env.KB_WRITER_SEND_TIMEOUT_MS || 12 * 60 * 1000),
+  // 实体源（entity/entity-all）上下文预算：
+  //   实体页专用 inline 上限（比通用文件的 24K 高——实体页是核查 ground truth，值得多给；超限带尾注不静默截）
+  ENTITY_INLINE_LIMIT: Number(process.env.KB_WRITER_ENTITY_LIMIT || 32000),
+  //   entity-all mode=full 的整类总字符上限（实测：产品/人 ≤40K 可整挂；公司 15 页 ~200K 会打爆→拒绝提示用 index）
+  ENTITY_ALL_FULL_LIMIT: Number(process.env.KB_WRITER_ENTITY_ALL_LIMIT || 40000),
+  // DeepSeek 调研工具循环：最多工具轮数（防空转烧钱/超时）
+  DS_MAX_TOOL_ROUNDS: Number(process.env.KB_WRITER_DS_MAX_ROUNDS || 12),
 };
 
 // DeepSeek（非 Claude provider）：key 引用机器上已有的位置（V3 的 .env.local），不复制明文到新地方。

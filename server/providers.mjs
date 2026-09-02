@@ -22,7 +22,8 @@ export function isAgentic(modelId) {
 }
 
 // key 引用机器上已有位置（V3 .env.local），不复制明文；env DEEPSEEK_API_KEY 可覆盖。
-function deepseekKey() {
+// 导出给 deepseekAgent（调研工具循环）复用，key 不进 git/bundle。
+export function deepseekKey() {
   if (process.env.DEEPSEEK_API_KEY) return process.env.DEEPSEEK_API_KEY.trim();
   try {
     const txt = fs.readFileSync(CONFIG.DEEPSEEK_KEY_FILE, 'utf8');

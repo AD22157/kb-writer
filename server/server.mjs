@@ -8,7 +8,10 @@ import { CONFIG } from './config.mjs';
 import { ensureNas, listDrafts, readDraft, writeDraft, publishFeedback, listVersions, readVersion, restoreVersion } from './kbStore.mjs';
 import { getSession, shutdownAll } from './claudeSession.mjs';
 import { assemble, snapshotApiSource } from './contextAssembler.mjs';
-import { readBasket, addSource, updateSource, removeSource, writeBasket, saveAttachment } from './contextStore.mjs';
+import {
+  readBasket, addSource, updateSource, removeSource, writeBasket, saveAttachment,
+  ENTITY_TYPES, listEntities, resolveEntityPage, classTotalChars,
+} from './contextStore.mjs';
 import { TOKEN, requireToken, lanAddresses } from './auth.mjs';
 import { startTask, budgetState, cancelTask, listResearchOutputs } from './orchestrator.mjs';
 import { isAgentic, runCompletion } from './providers.mjs';
@@ -140,12 +143,46 @@ app.get('/api/context', (req, res) => {
 app.post('/api/context/source', (req, res) => {
   const { name, source } = req.body || {};
   if (!name || !source?.type) return res.status(400).json({ error: '缺少 name/source.type' });
+  // 实体源：挂载时就解析/守门，别等装配时静默失败。
+  if (source.type === 'entity' || source.type === 'entity-all') {
+    if (!ENTITY_TYPES.includes(source.entityType)) return res.status(400).json({ error: 'entityType 须为 ' + ENTITY_TYPES.join('/') });
+    if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
+    if (source.type === 'entity') {
+      const hit = resolveEntityPage(source.entityType, source.entity);
+      if (!hit) return res.status(400).json({ error: `entities/${source.entityType}/ 与 _index.md 别名表都找不到「${source.entity}」` });
+      source.entity = hit.canonical;                       // 别名归一：输 "Anker" 存 "安克"
+      if (!source.label) source.label = hit.canonical;
+    } else {
+      if (!source.label) source.label = `所有${source.entityType}`;
+      if (source.mode === 'full') {
+        const total = classTotalChars(source.entityType);
+        if (total > CONFIG.ENTITY_ALL_FULL_LIMIT) {
+          return res.status(400).json({ error: `整类「${source.entityType}」共约 ${Math.round(total / 1000)}K 字符，超过 full 上限 ${Math.round(CONFIG.ENTITY_ALL_FULL_LIMIT / 1000)}K 会打爆上下文——请用 index 模式（注入该类索引表＋覆盖指令，涉及哪家读哪页）` });
+        }
+      }
+    }
+  }
   res.json(addSource(name, source));
 });
 app.patch('/api/context/source', (req, res) => {
   const { name, id, patch } = req.body || {};
   if (!name || !id || !patch) return res.status(400).json({ error: '缺少 name/id/patch' });
+  // entity-all 切 full 也过同一道守门（装配器还有超限自动回退 index 兜底）
+  if (patch.mode === 'full') {
+    const s0 = readBasket(name).sources.find((x) => x.id === id);
+    if (s0?.type === 'entity-all' && ensureNas()) {
+      const total = classTotalChars(s0.entityType);
+      if (total > CONFIG.ENTITY_ALL_FULL_LIMIT) {
+        return res.status(400).json({ error: `整类「${s0.entityType}」共约 ${Math.round(total / 1000)}K 字符 > full 上限 ${Math.round(CONFIG.ENTITY_ALL_FULL_LIMIT / 1000)}K——请用 index 模式` });
+      }
+    }
+  }
   res.json(updateSource(name, id, patch));
+});
+// 实体清单（「+ 挂实体」UI 选单）：扫 entities/{公司,人,产品}，NFC 归一、剔 _模板.md；附 dimensions（L3 只读挂）。
+app.get('/api/kb/entities', (req, res) => {
+  if (!ensureNas()) return res.status(503).json({ error: 'NAS 不可用' });
+  res.json(listEntities());
 });
 app.delete('/api/context/source', (req, res) => {
   const { name, id } = req.body || {};

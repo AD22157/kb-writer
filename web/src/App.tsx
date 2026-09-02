@@ -7,7 +7,7 @@ import { Basket, Source, UsedSource } from './api';
 const MODELS = [
   { id: 'claude-opus-5', label: 'opus（深度·全工具）' },
   { id: 'claude-fable-5', label: 'fable（快·全工具）' },
-  { id: 'deepseek-chat', label: 'DeepSeek（省额度·纯补全，无调研）' },
+  { id: 'deepseek-chat', label: 'DeepSeek（省额度·调研走后端工具循环）' },
 ];
 
 // 从流式反馈里抽出可落笔的候选（提议→确认落笔）
@@ -66,6 +66,10 @@ export default function App() {
   const [versions, setVersions] = useState<API.Version[] | null>(null);
   const [versionsErr, setVersionsErr] = useState('');
   const [versionPreview, setVersionPreview] = useState<{ file: string; content: string } | null>(null);
+  // 实体挂载（公司/人/产品 = L2 事实页；维度 = L3 只读）
+  const [showEntities, setShowEntities] = useState(false);
+  const [entType, setEntType] = useState<'公司' | '人' | '产品' | '维度L3'>('公司');
+  const [kbEnts, setKbEnts] = useState<Record<string, API.KbEntity[]> | null>(null);
   // 技能挂载 + 动作技能
   const [allSkills, setAllSkills] = useState<API.InstalledSkill[] | null>(null);
   const [showAllSkills, setShowAllSkills] = useState(false);
@@ -245,7 +249,40 @@ export default function App() {
     const label = prompt('标签', 'papablic-data 销量') || 'papablic-data';
     setBasket(await API.addSource(name, { type: 'api', skill: 'papablic-data', query, label, mode: 'live' }));
   };
-  const setMode = async (s: Source, mode: string) => setBasket(await API.patchSource(name, s.id, { mode }));
+  const setMode = async (s: Source, mode: string) => {
+    try { setBasket(await API.patchSource(name, s.id, { mode })); }
+    catch (e: any) { setErrorMsg(String(e.message || e)); }   // entity-all 切 full 超限会被 400 拒绝
+  };
+  // ---- 实体挂载 ----
+  const openEntityPicker = async () => {
+    setShowEntities(true);
+    if (!kbEnts) { try { setKbEnts(await API.getKbEntities()); } catch (e: any) { setErrorMsg('读实体清单失败：' + (e.message || e)); setKbEnts({}); } }
+  };
+  const entitySrcOf = (t: string, n: string) => basket.sources.find((s) => s.type === 'entity' && s.entityType === t && (s.entity === n || s.label === n));
+  const toggleEntity = async (t: string, n: string) => {
+    const ex = entitySrcOf(t, n);
+    try {
+      if (ex) setBasket(await API.delSource(name, ex.id));
+      else setBasket(await API.addSource(name, { type: 'entity', entityType: t, entity: n, mode: 'snapshot', label: n }));
+    } catch (e: any) { setErrorMsg('挂实体失败：' + (e.message || e)); }
+  };
+  const entityAllSrcOf = (t: string) => basket.sources.find((s) => s.type === 'entity-all' && s.entityType === t);
+  const toggleEntityAll = async (t: string) => {
+    const ex = entityAllSrcOf(t);
+    try {
+      if (ex) setBasket(await API.delSource(name, ex.id));
+      else setBasket(await API.addSource(name, { type: 'entity-all', entityType: t, mode: 'index', label: `所有${t}` }));
+    } catch (e: any) { setErrorMsg(String(e.message || e)); }
+  };
+  const dimSrcOf = (p?: string) => basket.sources.find((s) => s.type === 'file' && s.path === p);
+  const toggleDim = async (d: API.KbEntity) => {
+    if (!d.path) return;
+    const ex = dimSrcOf(d.path);
+    try {
+      if (ex) setBasket(await API.delSource(name, ex.id));
+      else setBasket(await API.addSource(name, { type: 'file', path: d.path, label: `L3·${d.name}`, mode: 'snapshot' }));
+    } catch (e: any) { setErrorMsg(String(e.message || e)); }
+  };
   const snapshot = async (s: Source) => {
     setStatusLine(`钉 ${s.label} 快照中（claude 现拉，约 1-2 分钟）…`);
     try { const r = await API.snapshotSource(name, s.id, model); setBasket(r.basket); setStatusLine('快照已钉：' + (r.snapshotAt || '')); }
@@ -490,14 +527,26 @@ export default function App() {
               <div key={s.id} className={`src ${s.enabled ? '' : 'off'}`}>
                 <label><input type="checkbox" checked={s.enabled} onChange={() => toggleSource(s)} /> <b>{s.label}</b></label>
                 <div className="src-meta">
-                  <span className="chip">{s.type}</span>
+                  <span className="chip">{s.type === 'entity' || s.type === 'entity-all' ? `${s.type}·${s.entityType}` : s.type}</span>
                   {s.type === 'api' && (
                     <select value={s.mode} onChange={(e) => setMode(s, e.target.value)}>
                       <option value="live">live（现拉）</option>
                       <option value="snapshot">snapshot（钉）</option>
                     </select>
                   )}
-                  {s.type !== 'api' && <span className="chip">{s.mode}</span>}
+                  {s.type === 'entity' && (
+                    <select value={s.mode} onChange={(e) => setMode(s, e.target.value)}>
+                      <option value="snapshot">snapshot（整页塞进上下文）</option>
+                      <option value="pointer">pointer（只指路，agent 自己读）</option>
+                    </select>
+                  )}
+                  {s.type === 'entity-all' && (
+                    <select value={s.mode} onChange={(e) => setMode(s, e.target.value)}>
+                      <option value="index">index（索引表＋覆盖指令）</option>
+                      <option value="full">full（整类全塞，≤40K 才允许）</option>
+                    </select>
+                  )}
+                  {!['api', 'entity', 'entity-all'].includes(s.type) && <span className="chip">{s.mode}</span>}
                   {s.skill && <span className="chip">{s.skill}</span>}
                   {s.query && <span className="q">“{s.query}”</span>}
                   {s.path && <span className="q">{s.path}</span>}
@@ -518,6 +567,7 @@ export default function App() {
               {uploading ? '上传中…' : '⬆ 上传附件作为上下文（点选或拖拽；PDF / md / 文本 / 数据表）'}
             </label>
             <div className="add-src">
+              <button onClick={openEntityPicker} disabled={!name} title="把 公司/人/产品 实体页（L2 事实）或维度（L3）挂进上下文">+ 挂实体</button>
               <button onClick={addApi} disabled={!name}>+ 挂 API（papablic-data）</button>
               <button onClick={addFile} disabled={!name} title="挂 mini 本机已有文件的路径">+ 挂 mini 本机文件</button>
             </div>
@@ -561,6 +611,55 @@ export default function App() {
                 ))}
               </div>
             </div>
+          </aside>
+        </div>
+      )}
+
+      {showEntities && (
+        <div className="drawer-mask" onClick={() => setShowEntities(false)}>
+          <aside className="drawer" onClick={(e) => e.stopPropagation()}>
+            <div className="drawer-head"><b>挂实体 · {name}</b><button onClick={() => setShowEntities(false)}>×</button></div>
+            <p className="muted">实体页=L2 事实（每行带日期与 src，可当核查 ground truth），随便挂。snapshot=整页塞进上下文；pointer=只指路让 agent 自己读。维度=L3 主人裁定，只读挂，矛盾时以 L3 为准。</p>
+            <div className="add-src">
+              {(['公司', '人', '产品', '维度L3'] as const).map((t) => (
+                <button key={t} className={entType === t ? 'primary' : ''} onClick={() => setEntType(t)}>{t}</button>
+              ))}
+            </div>
+            {entType !== '维度L3' && (() => {
+              const allSrc = entityAllSrcOf(entType);
+              return (
+                <div className="src">
+                  <label><input type="checkbox" checked={!!allSrc} onChange={() => toggleEntityAll(entType)} /> <b>整类全挂（所有{entType}）</b></label>
+                  <div className="src-meta">
+                    {allSrc ? (
+                      <select value={allSrc.mode} onChange={(e) => setMode(allSrc, e.target.value)}>
+                        <option value="index">index（该类索引表＋"涉及哪家读哪页"指令）</option>
+                        <option value="full">full（整类页面全塞，总量 ≤40K 才允许）</option>
+                      </select>
+                    ) : <span className="q">勾选后默认 index：装配时现从 _index.md 抽该类表注入</span>}
+                  </div>
+                </div>
+              );
+            })()}
+            {kbEnts === null && <p className="muted">读取中…</p>}
+            {kbEnts && entType !== '维度L3' && (kbEnts[entType] || []).map((ent) => {
+              const on = !!entitySrcOf(entType, ent.name);
+              return (
+                <div key={ent.name} className={`src ${on ? '' : 'off'}`}>
+                  <label><input type="checkbox" checked={on} onChange={() => toggleEntity(entType, ent.name)} /> <b>{ent.name}</b>
+                    {ent.bytes != null && <span className="muted"> · {(ent.bytes / 1024).toFixed(0)}KB</span>}</label>
+                </div>
+              );
+            })}
+            {kbEnts && entType === '维度L3' && (kbEnts.dimensions || []).map((d) => {
+              const on = !!dimSrcOf(d.path);
+              return (
+                <div key={d.name} className={`src ${on ? '' : 'off'}`}>
+                  <label><input type="checkbox" checked={on} onChange={() => toggleDim(d)} /> <b>{d.name}</b> <span className="chip">L3</span></label>
+                </div>
+              );
+            })}
+            {kbEnts && entType === '维度L3' && !(kbEnts.dimensions || []).length && <p className="muted">kb/dimensions/ 下还没有维度文件。</p>}
           </aside>
         </div>
       )}

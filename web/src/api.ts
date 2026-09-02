@@ -64,6 +64,7 @@ export interface Draft { name: string; mtime: number }
 export interface Source {
   id: string; type: string; enabled: boolean; mode: string; label: string;
   path?: string; skill?: string; query?: string; ref?: string;
+  entityType?: string; entity?: string;
   snapshot?: string; snapshotAt?: string;
 }
 export interface Basket { version: number; sources: Source[]; skills?: string[] }
@@ -91,6 +92,9 @@ export async function uploadAttachment(name: string, file: File): Promise<{ bask
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
   return res.json();
 }
+// 实体清单（挂实体 UI 选单）：{公司:[{name,bytes}],人:[…],产品:[…],dimensions:[{name,path}]}
+export interface KbEntity { name: string; bytes?: number; path?: string }
+export const getKbEntities = () => api('/api/kb/entities') as Promise<Record<string, KbEntity[]>>;
 export const publishFeedback = (name: string, feedbackMarkdown: string) =>
   api('/api/publish-feedback', { method: 'POST', body: JSON.stringify({ name, feedbackMarkdown }) });
 
