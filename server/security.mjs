@@ -93,18 +93,21 @@ export function apiSessionSettings() {
 }
 
 // research 档：调研需要"更宽的读取向能力"，不是任意 shell/出网。
-//   给：WebSearch（广搜片段）+ WebFetch(只到白名单域，实测 permission 层拦得住) + 读 kb + 只读非-Bash skill。
+//   给：WebSearch（广搜片段）+ WebFetch（放宽到任意公网源，取一手源）+ 读 kb + 只读非-Bash skill。
 //   不给：Bash（→无 curl 任意 POST）、Write/Edit（→scratch 由服务端可信写，agent 只读）。
 //   硬边界一条不减：denyRead 密钥、写全禁、沙箱兜底。防注入网页把库/草稿 POST/GET 外泄。
+// 2026-09 放宽：WebFetch 原来按 RESEARCH_DOMAINS 逐域 scoping，太窄——公司官网/IR/巴菲特年报全被拦，
+//   opus 的 WebFetch 够不着一手源。改为整体放行 `WebFetch`（任意公网源）。该档已只读、无 Bash 写、无密钥
+//   可外泄，且 WebFetch 由工具侧执行、响应只回给模型——风险面主要是 SSRF，而 WebFetch 取不到本机私网服务。
+//   **只放宽本 research 档；write/api 档网络策略一律不动**（api 仍锁死只到网关、write 全禁网络）。
 export function researchSessionSettings() {
   return {
-    sandbox: baseSandbox([], []),   // 无 Bash → 无 Bash 子进程网络；WebFetch 走 permission 层白名单
+    sandbox: baseSandbox([], []),   // 无 Bash → 无 Bash 子进程网络；WebFetch 走 permission 层（下面整体放行）
     permissions: {
       deny: ['Bash', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Task'],
       allow: [
         `Read(${KB_GLOB})`, `Grep(${KB_GLOB})`, `Glob(${KB_GLOB})`,
-        'WebSearch', 'Skill',
-        ...CONFIG.RESEARCH_DOMAINS.map((d) => `WebFetch(domain:${d})`),
+        'WebSearch', 'WebFetch', 'Skill',
       ],
     },
   };

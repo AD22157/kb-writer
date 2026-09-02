@@ -23,12 +23,16 @@ export const CONFIG = {
   PY312: '/opt/homebrew/opt/python@3.12/bin/python3.12',
   // 会话空闲多久回收（毫秒）。回收后下次请求重新冷启。
   SESSION_IDLE_MS: Number(process.env.KB_WRITER_SESSION_IDLE_MS || 20 * 60 * 1000),
-  // research 档 WebFetch 只允许这些域（防注入网页把数据 GET 外泄；实测 permission 层 domain scoping 生效）。
-  // WebSearch 不受限（只返回搜索片段，非直连外泄）。用户可按需扩这个白名单。
+  // 「curated 一手源根」= 调研最想直达的可信公网源（*.gov / 年报 / 百科 / 财经 / arctic-shift / 网关）。
+  // 2026-09 改：deepseek 的 web_fetch 不再拿这份当「唯一可 fetch 的白名单」——那太窄，公司官网/IR/
+  //   巴菲特年报全被拦，一手源够不着。现在 web_fetch 放开到「任意公网 http(s) + SSRF 护栏」
+  //   （拒私网/环回/链路本地/云元数据，逐跳复校，见 deepseekAgent.mjs 的 assertPublicHost）。
+  //   这份清单降级为「可信根」：命中它的域跳过 DNS 解析直接放行（防瞬时 DNS 抖动误伤必需源，
+  //   且保证 arctic-shift / gateway 永远可达），其余域走完整 SSRF 解析校验。
+  // claude 研究档的 WebFetch 同步从「按域 scoping」放宽为整体放行（见 security.mjs），使 opus 也能取一手源。
   RESEARCH_DOMAINS: (process.env.KB_RESEARCH_DOMAINS ||
-    // arctic-shift = Reddit 只读存档 API（免鉴权、GET-only JSON）。研究档 agent 无 Bash，
-    // 直接 WebFetch 这个域取 Reddit 数据（发不出数据）——比给 Bash+网络安全得多。
-    'en.wikipedia.org,zh.wikipedia.org,github.com,raw.githubusercontent.com,www.sec.gov,www.annualreports.com,finance.yahoo.com,www.crunchbase.com,arctic-shift.photon-reddit.com')
+    // arctic-shift = Reddit 只读存档 API（免鉴权、GET-only JSON）；gateway = 网关（必需放行，别搞丢）。
+    'en.wikipedia.org,zh.wikipedia.org,github.com,raw.githubusercontent.com,sec.gov,www.annualreports.com,finance.yahoo.com,www.crunchbase.com,berkshirehathaway.com,tesla.com,arctic-shift.photon-reddit.com,gateway.papablic.com')
     .split(',').map((s) => s.trim()).filter(Boolean),
   // 多 agent 编排护栏
   MAX_PARALLEL_TASKS: Number(process.env.KB_WRITER_MAX_PARALLEL || 3),
