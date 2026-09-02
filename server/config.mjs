@@ -63,6 +63,22 @@ export const CONFIG = {
 CONFIG.DEEPSEEK_KEY_FILE = process.env.KB_WRITER_DEEPSEEK_KEY_FILE ||
   path.join(HOME, '.openclaw', 'workspace-marketing', 'projects', 'influencer-v3', '.env.local');
 CONFIG.DEEPSEEK_BASE = process.env.KB_WRITER_DEEPSEEK_BASE || 'https://api.deepseek.com';
+
+// —— web_search 后端增强（2026-09）——
+// 本机（mini）走 Surge fake-ip 代理：google.com/bing.com 等经 TUN 路由到国外节点可达，但
+//   ① Google 无-JS 端点已死（返回 JS 壳，0 可解析结果）——纯 HTML 抓 Google 行不通，只能走 CSE API；
+//   ② 百度/搜狗对本代理共享出口 IP 触发验证码墙（实测双双 captcha）——中文只剩 Bing 稳定可解析；
+//   ③ 公共 SearXNG 实例本机全不可达/反爬墙。
+// 因此 web_search 的级联优先级（择优取第一个过相关性闸门的）：
+//   [本机 SearXNG（若配 URL）]→[Google CSE（若有 key）]→[Brave API（若有 key）]→Bing→搜狗→百度。
+//   前三个是"可选增强后端"：只在被 provision（阿峰给 key / 起本地实例）后自动生效，缺省安全降级到 Bing 级联。
+// 本机自建 SearXNG（只监听 127.0.0.1）时把它的地址填这里，web_search 自动优先用它（内部聚合 Google/Bing/DDG）。
+CONFIG.SEARXNG_URL = (process.env.KB_WRITER_SEARXNG_URL || '').replace(/\/+$/, '');
+// 搜索 API 密钥文件（600，在 ~/.kb-collector 下——不在 git 仓库内，绝不进 bundle/日志）。
+// 格式：每行 KEY=VALUE，认 GOOGLE_CSE_KEY / GOOGLE_CSE_CX / BRAVE_SEARCH_KEY。env 同名变量可覆盖。
+CONFIG.SEARCH_KEYS_FILE = process.env.KB_WRITER_SEARCH_KEYS_FILE ||
+  path.join(HOME, '.kb-collector', 'search-keys.env');
+
 // 动作技能（补充/修正/提问/起草 的方法论，可编辑文件；放 ~/sync 自带 git 版本史）
 CONFIG.ACTIONS_DIR = process.env.KB_WRITER_ACTIONS_DIR || path.join(HOME, 'sync', 'skills', 'QS-写作', 'actions');
 // 全局技能目录（挂载技能的候选来源）

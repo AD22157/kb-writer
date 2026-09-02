@@ -294,6 +294,113 @@ async function fetchBing(q, n, signal) {
   return { ok: true, results: out };
 }
 
+// —— 可选增强后端（provision 后自动生效；缺省安全降级到 Bing 级联）——
+// 搜索 API 密钥读取：env 优先，其次 CONFIG.SEARCH_KEYS_FILE（600，~/.kb-collector 下，不在 git/bundle 内）。
+// 每次调用现读（key 轮换即时生效、无需重启），带 200ms 级微缓存避免每次 search 都读盘。
+let _skCache = { at: 0, val: null };
+function searchKeys() {
+  const now = Date.now();
+  if (_skCache.val && now - _skCache.at < 5000) return _skCache.val;
+  const out = {
+    googleKey: (process.env.GOOGLE_CSE_KEY || '').trim(),
+    googleCx: (process.env.GOOGLE_CSE_CX || '').trim(),
+    braveKey: (process.env.BRAVE_SEARCH_KEY || '').trim(),
+  };
+  try {
+    const txt = fs.readFileSync(CONFIG.SEARCH_KEYS_FILE, 'utf8');
+    const pick = (k) => (txt.match(new RegExp('^' + k + '=(.+)$', 'm')) || [])[1];
+    const unq = (v) => (v ? v.trim().replace(/^["']|["']$/g, '') : '');
+    out.googleKey ||= unq(pick('GOOGLE_CSE_KEY'));
+    out.googleCx ||= unq(pick('GOOGLE_CSE_CX'));
+    out.braveKey ||= unq(pick('BRAVE_SEARCH_KEY'));
+  } catch { /* 文件不存在 = 未 provision，走无 key 级联 */ }
+  _skCache = { at: now, val: out };
+  return out;
+}
+
+// 本机自建 SearXNG（只监听 127.0.0.1）：JSON API 聚合 Google/Bing/DDG 等，天然绕单引擎封锁。
+// 只有配了 CONFIG.SEARXNG_URL 才走这条；URL 必须是本机回环/内网自建实例（不是公共实例——公共实例本机全不可达）。
+async function fetchSearxng(q, n, signal) {
+  const base = CONFIG.SEARXNG_URL;
+  if (!base) return { ok: false, err: 'SearXNG 未配置' };
+  const lang = hasCJK(q) ? 'zh' : 'en';
+  const url = `${base}/search?q=${encodeURIComponent(q)}&format=json&language=${lang}&safesearch=0`;
+  const res = await fetch(url, { signal, redirect: 'follow', headers: { 'user-agent': SEARCH_UA, accept: 'application/json' } });
+  if (!res.ok) return { ok: false, err: `SearXNG HTTP ${res.status}` };
+  let j; try { j = await res.json(); } catch { return { ok: false, err: 'SearXNG 返回非 JSON（实例可能未开 json format）' }; }
+  const out = (j.results || []).slice(0, n).map((r) => ({
+    title: String(r.title || '').slice(0, 140),
+    url: String(r.url || ''),
+    snippet: String(r.content || '').slice(0, 300),
+  })).filter((r) => r.url);
+  return { ok: true, results: out };
+}
+
+// Google Programmable Search (CSE) API：干净 JSON、真 Google 质量、中英通吃。需 key + cx（每天 100 次免费）。
+async function fetchGoogleCse(q, n, signal) {
+  const { googleKey, googleCx } = searchKeys();
+  if (!googleKey || !googleCx) return { ok: false, err: 'Google CSE 未配置 key/cx' };
+  const url = `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(googleKey)}&cx=${encodeURIComponent(googleCx)}`
+    + `&q=${encodeURIComponent(q)}&num=${Math.min(n, 10)}`;
+  const res = await fetch(url, { signal, redirect: 'follow', headers: { accept: 'application/json' } });
+  if (!res.ok) {
+    let hint = '';
+    if (res.status === 429) hint = '（当日免费额度用尽，明天恢复或去 Cloud Console 提额）';
+    if (res.status === 403) hint = '（key/cx 无效或未开通 Custom Search API）';
+    return { ok: false, err: `Google CSE HTTP ${res.status}${hint}` };
+  }
+  let j; try { j = await res.json(); } catch { return { ok: false, err: 'Google CSE 返回非 JSON' }; }
+  const out = (j.items || []).slice(0, n).map((it) => ({
+    title: String(it.title || '').slice(0, 140),
+    url: String(it.link || ''),
+    snippet: String(it.snippet || '').replace(/\s+/g, ' ').slice(0, 300),
+  })).filter((r) => r.url);
+  return { ok: true, results: out };
+}
+
+// Brave Search API：独立索引、干净 JSON、中英通吃。需 key（免费档约 2000 次/月）。
+async function fetchBraveApi(q, n, signal) {
+  const { braveKey } = searchKeys();
+  if (!braveKey) return { ok: false, err: 'Brave API 未配置 key' };
+  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(q)}&count=${Math.min(n, 20)}`;
+  const res = await fetch(url, { signal, redirect: 'follow', headers: { accept: 'application/json', 'accept-encoding': 'gzip', 'x-subscription-token': braveKey } });
+  if (!res.ok) return { ok: false, err: `Brave API HTTP ${res.status}${res.status === 429 ? '（限流/额度）' : res.status === 401 ? '（key 无效）' : ''}` };
+  let j; try { j = await res.json(); } catch { return { ok: false, err: 'Brave API 返回非 JSON' }; }
+  const out = ((j.web && j.web.results) || []).slice(0, n).map((r) => ({
+    title: String(r.title || '').slice(0, 140),
+    url: String(r.url || ''),
+    snippet: String(r.description || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').slice(0, 300),
+  })).filter((r) => r.url);
+  return { ok: true, results: out };
+}
+
+// —— Reddit 并入 web_search（社区口碑类 query 的一路来源）——
+// arctic-shift 无全站关键词搜（body/query 必须搭配 subreddit），且检索的是英文 Reddit。
+// 因此并入策略：仅当 query 触及"社区口碑/评价/体验"意图、且能取到 ASCII/品牌 token 时，best-effort
+// 在少量默认母婴 subreddit 上搜评论并附带（Papablic 主力场景）；中文纯词或无 ASCII token 则跳过（改由模型
+// 直接调 reddit 工具做深挖，system prompt 已强化引导）。失败/限流一律静默降级，绝不拖垮 web_search。
+const COMMUNITY_HINT = /(reddit|口碑|评价|测评|好不好|怎么样|值得买|值不值|体验|吐槽|优缺点|缺点|真实|reviews?|worth\s+it|complaints?|opinions?|recommend|vs\b)/i;
+const DEFAULT_REDDIT_SUBS = ['NewParents', 'beyondthebump', 'Mommit'];
+function communityIntent(q) { return COMMUNITY_HINT.test(q); }
+function asciiTokens(q) { return (q.toLowerCase().match(/[a-z][a-z0-9'-]{2,}/g) || []).filter((w) => !/^(the|and|for|with|reviews?|worth|complaints?|opinions?|recommend|reddit)$/.test(w)); }
+async function tryRedditMerge(q, signal) {
+  const terms = asciiTokens(q);
+  if (!terms.length) return [];   // 中文纯词 → arctic-shift 搜不了，交给模型直接调 reddit 工具
+  const query = terms.slice(0, 4).join(' ');
+  const rows = [];
+  // 用 search_posts（帖标题/正文当线索，比评论碎片更有用，且比 comments 搜更少触发 arctic-shift 限流）；
+  // 逐个子版、best-effort，任一 422/限流即跳过——绝不因 Reddit 拖垮 web_search。
+  for (const sub of DEFAULT_REDDIT_SUBS.slice(0, 2)) {
+    try {
+      const r = await toolReddit({ op: 'search_posts', subreddit: sub, query, limit: 5 }, signal);
+      const arr = JSON.parse(r);
+      if (Array.isArray(arr)) for (const it of arr) rows.push({ subreddit: it.sub, date: it.date, score: it.score, comments: it.comments, title: it.title, url: it.url });
+    } catch { /* 非 JSON（错误串/限流）→ 跳过 */ }
+    if (rows.length) break;   // 首个命中即停：arctic-shift 限流严，不做多余调用（深挖交给 reddit 工具）
+  }
+  return rows.slice(0, 6);
+}
+
 const REL_MIN = 0.34;   // 命中率低于此 → 判定检索质量存疑，诚实降级标注
 
 export async function toolWebSearch({ query, count } = {}, signal) {
@@ -301,12 +408,16 @@ export async function toolWebSearch({ query, count } = {}, signal) {
   if (!q) return '错误：缺少 query';
   const n = Math.min(Math.max(Number(count) || 8, 1), 10);
   const tokens = queryTokens(q);
-  // 级联多后端，取第一个「过相关性闸门」的结果即停：
-  //   中文主题 → 百度 → 搜狗 → 必应（Bing 对中文常喂反爬诱饵；百度被本代理出口 IP captcha 墙时搜狗兜底）；
-  //   英文主题 → 必应 → 搜狗 → 百度。全部过闸门，都不达标则返回最优的一份并诚实标注质量存疑。
-  const backends = hasCJK(q)
-    ? [['baidu', fetchBaidu], ['sogou', fetchSogou], ['bing', fetchBing]]
-    : [['bing', fetchBing], ['sogou', fetchSogou], ['baidu', fetchBaidu]];
+  const keys = searchKeys();
+  // 级联多后端，取第一个「过相关性闸门」的结果即停。优先级 = 检索质量：
+  //   [本机 SearXNG（若配 URL）]→[Google CSE（若有 key）]→[Brave API（若有 key）]→Bing→搜狗→百度。
+  //   增强后端（前三）只在被 provision 后自动进级联；无 key 时缺省从 Bing 起（本代理下中文只有 Bing 稳定可解析，
+  //   百度/搜狗常被共享出口 IP 验证码墙——放在最后当 IP 轮换/英文时的兜底）。全过闸门则返回最优并诚实标注质量存疑。
+  const backends = [];
+  if (CONFIG.SEARXNG_URL) backends.push(['searxng', fetchSearxng]);
+  if (keys.googleKey && keys.googleCx) backends.push(['google-cse', fetchGoogleCse]);
+  if (keys.braveKey) backends.push(['brave', fetchBraveApi]);
+  backends.push(['bing', fetchBing], ['sogou', fetchSogou], ['baidu', fetchBaidu]);
   let best = null; const notes = [];
   for (const [name, fn] of backends) {
     let r;
@@ -317,7 +428,11 @@ export async function toolWebSearch({ query, count } = {}, signal) {
     if (!best || ratio > best.ratio || (ratio === best.ratio && r.results.length > best.results.length)) best = cand;
     if (r.results.length && ratio >= REL_MIN) { best = cand; break; }  // 命中率达标 → 采用，不再试下一后端
   }
+  // Reddit 并入：社区口碑意图时 best-effort 附带（失败静默）
+  let reddit = [];
+  if (communityIntent(q)) { try { reddit = await tryRedditMerge(q, signal); } catch { /* 静默 */ } }
   if (!best || !best.results.length) {
+    if (reddit.length) return JSON.stringify({ source: 'reddit(arctic-shift)', web_count: 0, note: '网页后端无结果，仅 Reddit 社区源命中', reddit }, null, 1);
     return `搜索无结果（尝试 ${backends.map((b) => b[0]).join('/')}${notes.length ? '；' + notes.join('；') : ''}）。换关键词，或改用 reddit / web_fetch 一手源 / kb_read。`;
   }
   const payload = { source: best.name, count: best.results.length, results: best.results };
@@ -326,6 +441,7 @@ export async function toolWebSearch({ query, count } = {}, signal) {
     payload.quality = '⚠️ 检索质量存疑';
     payload.warning = `仅 ${best.matched}/${best.results.length} 条结果与查询词匹配——检索后端可能返回了无关内容（反爬诱饵/结构变化）。请勿把以下结果当已核实事实：用 web_fetch 打开原文逐条核对，或换关键词、改用 reddit / kb_read。`;
   }
+  if (reddit.length) { payload.reddit = reddit; payload.reddit_note = '以下 Reddit 评论来自 arctic-shift 存档（默认母婴 subreddit 探测）；要深挖社区口碑请直接调 reddit 工具搜更多 subreddit。'; }
   return JSON.stringify(payload, null, 1);
 }
 
@@ -372,7 +488,7 @@ export async function toolReddit(args = {}, signal) {
 
 export const DS_TOOLS = [
   { type: 'function', function: { name: 'kb_read', description: '只读 339 知识库：entities/（L2 事实页，每行带日期与 src，是核查 ground truth）与 dimensions/（L3 主人裁定的理解）。传相对路径；传目录路径则列出其中文件。先读 entities/_index.md 查别名表定位实体。', parameters: { type: 'object', properties: { path: { type: 'string', description: '相对路径，如 "entities/_index.md"、"entities/公司/安克.md"、"dimensions/"' } }, required: ['path'] } } },
-  { type: 'function', function: { name: 'web_search', description: '网页搜索，返回 {source,count,results:[{title,url,snippet}]}（中文走百度/搜狗、英文走必应，级联择优）。先搜线索、再用 web_fetch 读原文。若返回带 quality="⚠️ 检索质量存疑"，说明结果与查询词匹配度低、可能是无关噪音——不要当已核实事实，逐条 web_fetch 核对或换词。', parameters: { type: 'object', properties: { query: { type: 'string' }, count: { type: 'number', description: '结果数，默认 8，最多 10' } }, required: ['query'] } } },
+  { type: 'function', function: { name: 'web_search', description: '网页搜索，返回 {source,count,results:[{title,url,snippet}]}。多后端级联择优：有 Google CSE / Brave / 本机 SearXNG 配置时优先用它们（真 Google/独立索引质量、中英通吃），否则走 Bing（中文权威结果稳定，如公司官网/百科/财经），搜狗/百度兜底。先搜线索、再用 web_fetch 读原文。社区口碑类查询（含品牌英文词）会自动附带一小段 Reddit 评论（payload.reddit）——要深挖社区口碑请直接调 reddit 工具搜更多 subreddit。若返回带 quality="⚠️ 检索质量存疑"，说明结果与查询词匹配度低、可能是无关噪音——不要当已核实事实，逐条 web_fetch 核对或换词。', parameters: { type: 'object', properties: { query: { type: 'string' }, count: { type: 'number', description: '结果数，默认 8，最多 10' } }, required: ['query'] } } },
   { type: 'function', function: { name: 'web_fetch', description: '抓取一个网页/PDF 正文（GET-only，只 http(s)）。可取任意公网一手源——公司官网/IR 页、SEC/*.gov、巴菲特年报(berkshirehathaway.com)PDF、维基百科等；PDF 会自动抽正文。内置 SSRF 护栏拒私网/环回/云元数据地址。少数站点（如 tesla.com）有反爬硬墙返回 403，本工具绕不过——换其它源。', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } },
   { type: 'function', function: { name: 'reddit', description: 'Reddit 检索（走 arctic-shift 存档 API；reddit.com 直连不通，一律用本工具）。op=search_posts 搜帖 / search_comments 搜评论 / post_comments 取某帖全部评论。关键词搜索必须搭配 subreddit（无全站搜），母婴常用：NewParents、beyondthebump、Mommit、BabyBumps、breastfeeding、daddit——逐个搜。', parameters: { type: 'object', properties: { op: { type: 'string', enum: ['search_posts', 'search_comments', 'post_comments'] }, subreddit: { type: 'string', description: '必填（除 post_comments）。如 NewParents、beyondthebump、Mommit' }, query: { type: 'string', description: '关键词' }, link_id: { type: 'string', description: 'post_comments 用：帖子 id' }, after: { type: 'string', description: 'YYYY-MM-DD 起始日期' }, limit: { type: 'number', description: '默认 15，最多 25' } }, required: ['op'] } } },
   { type: 'function', function: { name: 'feishu_read', description: '读取一个飞书/Lark 链接的内容当作上下文（只读，走已授权的用户身份）。**只要任务/草稿正文/选段/上下文里出现飞书链接（feishu.cn / larksuite.com），先用本工具把它读进来再作答，绝不回避说“链接内容未提供”。** 支持：drive 文件夹（会列出整个目录清单并展开读前若干篇 docx/表格）、docx/wiki 文档、电子表格。文件夹很大时只展开前 N 篇；要读其中某一篇的全文，就对那篇文档自己的飞书链接再调一次本工具。多个链接逐个读。', parameters: { type: 'object', properties: { url: { type: 'string', description: '完整飞书链接，如 https://xxx.feishu.cn/drive/folder/<token> 或 /docx/<token> 或 /sheets/<token>' }, max_docs: { type: 'number', description: '文件夹模式最多展开几篇文档，默认 8，最多 20' } }, required: ['url'] } } },
