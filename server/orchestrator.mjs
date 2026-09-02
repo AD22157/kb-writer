@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { CONFIG, WRITING_DIR } from './config.mjs';
 import { getSession, killSession } from './claudeSession.mjs';
-import { assemble } from './contextAssembler.mjs';
+import { assembleContext } from './contextAssembler.mjs';
 import { isAgentic, runCompletion } from './providers.mjs';
 import { runDeepseekResearch } from './deepseekAgent.mjs';
 import { buildNonAgenticSystemPrompt, buildDeepseekResearchSystemPrompt } from './systemPrompt.mjs';
@@ -64,7 +64,8 @@ export async function startTask(name, type, instruction, selection, model, onEve
   const agentic = isAgentic(mid);
   // research + deepseek 不再拒绝：走后端工具循环（kb_read/web_search/web_fetch/reddit，后端替它执行）。
   const dsResearch = kind === 'research' && !agentic;
-  const { contextBlock } = assemble(name, { agentic, kbTool: dsResearch });
+  // 扫指令 + 选段里裸贴的飞书链接（子任务同样吃自动内联的飞书快照）
+  const { contextBlock } = await assembleContext(name, { agentic, kbTool: dsResearch, scanText: [instruction, selection].filter(Boolean).join('\n') });
   const sessionKey = `task:${id}`;
   const session = agentic ? getSession(sessionKey, mid, kind) : null;
   onEvent({ type: 'started', id, kind: agentic ? kind : (dsResearch ? 'deepseek-tools' : 'completion') });

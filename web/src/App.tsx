@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { marked } from 'marked';
 import Editor, { EditorHandle } from './Editor';
 import * as API from './api';
-import { Basket, Source, UsedSource } from './api';
+import { Basket, Source, UsedSource, AutoFeishu } from './api';
 
 const MODELS = [
   { id: 'claude-opus-5', label: 'opus（深度·全工具）' },
@@ -60,6 +60,7 @@ export default function App() {
   const [panelMd, setPanelMd] = useState('');
   const [streaming, setStreaming] = useState(false);
   const [used, setUsed] = useState<UsedSource[]>([]);
+  const [autoFeishu, setAutoFeishu] = useState<AutoFeishu | null>(null);
   const [toolsSeen, setToolsSeen] = useState<string[]>([]);
   const [statusLine, setStatusLine] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
@@ -326,14 +327,14 @@ export default function App() {
 
   // ---- streaming turn ----
   const stream = async (path: string, body: any) => {
-    setStreaming(true); setPanelMd(''); setUsed([]); setToolsSeen([]); setStatusLine('分析中…'); setPublishUrl(''); setErrorMsg('');
+    setStreaming(true); setPanelMd(''); setUsed([]); setAutoFeishu(null); setToolsSeen([]); setStatusLine('分析中…'); setPublishUrl(''); setErrorMsg('');
     let acc = '';
     // docType 一起送后端：dim 时后端不得把内容当草稿写进 kb/writing（L3 只走 PUT /api/dimension）
     await API.sse(path, { ...body, name, model, docType: docTypeRef.current }, (e) => {
-      if (e.type === 'context') { setUsed(e.used); }
+      if (e.type === 'context') { setUsed(e.used); if (e.autoFeishu) setAutoFeishu(e.autoFeishu); }
       else if (e.type === 'tool') { setToolsSeen((t) => [...t, e.name]); setStatusLine(`agent 正在用 ${e.name}…`); }
       else if (e.type === 'delta') { acc += e.text; setPanelMd(acc); setStatusLine(''); }
-      else if (e.type === 'done') { setStatusLine(`完成 · ${(e.ms / 1000).toFixed(1)}s · $${(e.cost || 0).toFixed(4)}`); setUsed(e.used || []); }
+      else if (e.type === 'done') { setStatusLine(`完成 · ${(e.ms / 1000).toFixed(1)}s · $${(e.cost || 0).toFixed(4)}`); setUsed(e.used || []); if (e.autoFeishu) setAutoFeishu(e.autoFeishu); }
       else if (e.type === 'error') { setStatusLine(''); setErrorMsg(e.message); }
     }).catch((err) => { setStatusLine(''); setErrorMsg(err.message === 'unauthorized' ? 'token 失效，请重新进入' : ('连接中断：' + err.message + '（可重试）')); });
     setStreaming(false);
@@ -705,8 +706,28 @@ export default function App() {
 
           {(used.length > 0 || toolsSeen.length > 0) && (
             <div className="trace">
-              上下文：{used.map((u) => <span key={u.id} className={`chip ${u.mode}`}>{u.label}·{u.mode}</span>)}
+              上下文：{used.map((u) => <span key={u.id} className={`chip ${u.mode.startsWith('auto') ? (u.mode.includes('失败') ? 'autofail' : 'autofeishu') : u.mode}`}>{u.label}·{u.mode}</span>)}
               {toolsSeen.length > 0 && <> ｜ 工具：{[...new Set(toolsSeen)].map((t) => <span key={t} className="chip tool">{t}</span>)}</>}
+            </div>
+          )}
+          {autoFeishu && autoFeishu.found > 0 && (
+            <div className="trace feishu-auto">
+              本文引用飞书链接 {autoFeishu.found} 个：已读 <b>{autoFeishu.read}</b>
+              {autoFeishu.cached > 0 && <>（其中缓存 {autoFeishu.cached}）</>}
+              {autoFeishu.failed > 0 && <span className="feishu-fail"> · 失败 {autoFeishu.failed}</span>}
+              {autoFeishu.skipped > 0 && <span className="muted"> · 跳过 {autoFeishu.skipped}</span>}
+              {autoFeishu.links.filter((l) => l.status === 'failed').map((l, i) => (
+                <div key={i} className="feishu-fail-line">⚠️ 没读到 {l.url}{l.reason ? '：' + l.reason : ''}</div>
+              ))}
+              {autoFeishu.links.filter((l) => l.status === 'note-only').map((l, i) => (
+                <div key={'n' + i} className="muted feishu-note-line">ℹ️ {l.type || '该类型'}未展开全文（仅登记）：{l.url}</div>
+              ))}
+              {autoFeishu.links.some((l) => l.status === 'mounted') && (
+                <div className="muted">·{autoFeishu.links.filter((l) => l.status === 'mounted').length} 个已由「+挂飞书」挂载源覆盖，未重复自动读</div>
+              )}
+              {autoFeishu.links.some((l) => l.status === 'limit') && (
+                <div className="muted">·{autoFeishu.links.filter((l) => l.status === 'limit').length} 个超本轮自动读上限，未读（可「+挂飞书」显式挂）</div>
+              )}
             </div>
           )}
           {errorMsg && (

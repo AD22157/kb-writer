@@ -10,7 +10,7 @@ import {
   listDimensions, readDimension, writeDimension,
 } from './kbStore.mjs';
 import { getSession, shutdownAll } from './claudeSession.mjs';
-import { assemble, snapshotApiSource, snapshotFeishuSource } from './contextAssembler.mjs';
+import { assembleContext, snapshotApiSource, snapshotFeishuSource } from './contextAssembler.mjs';
 import {
   readBasket, addSource, updateSource, removeSource, writeBasket, saveAttachment,
   ENTITY_TYPES, listEntities, resolveEntityPage, classTotalChars,
@@ -67,11 +67,13 @@ const sseSend = (res, obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
 // 统一跑一个流式 turn（带上下文装配 + 工具追溯）。
 // 非 agentic 模型（deepseek）：无工具，直连补全，吃装配器快照；调研类能力不可用（诚实边界在 system prompt）。
 // memoryTurn = { label, masterText }：轮成功结束后触发一次轮末记忆抽取（fire-and-forget，不阻塞响应）。
-async function runTurn(res, { name, model, buildPrompt, memoryTurn }) {
+async function runTurn(res, { name, model, buildPrompt, memoryTurn, scanText }) {
   const agentic = isAgentic(model);
-  const { contextBlock, kind, used, skillNames } = assemble(name, { agentic });
+  // scanText = 草稿正文 + 选段（+提问/大纲）：装配时扫其中裸贴的飞书链接、用飞书身份读进 contextBlock，
+  // 对所有模型（含无工具 deepseek 直连补全）生效。缓存/去重/限量/失败可见都在 assembleContext 里。
+  const { contextBlock, kind, used, skillNames, autoFeishu } = await assembleContext(name, { agentic, scanText });
   sseInit(res);
-  sseSend(res, { type: 'context', used, kind: agentic ? kind : 'completion', skills: skillNames || [] });
+  sseSend(res, { type: 'context', used, kind: agentic ? kind : 'completion', skills: skillNames || [], autoFeishu });
   const started = Date.now();
   let reply = '';
   let okDone = false;
@@ -84,7 +86,7 @@ async function runTurn(res, { name, model, buildPrompt, memoryTurn }) {
         { timeoutMs: CONFIG.SEND_TIMEOUT_MS },
       );
       okDone = true;
-      sseSend(res, { type: 'done', ms: Date.now() - started, cost: 0, toolsSeen: [], used, usage, note: 'deepseek 直连（费用极低，未计入预算）' });
+      sseSend(res, { type: 'done', ms: Date.now() - started, cost: 0, toolsSeen: [], used, usage, autoFeishu, note: 'deepseek 直连（费用极低，未计入预算）' });
     } else {
       const session = getSession(name, model, kind);
       const toolsSeen = [];
@@ -95,7 +97,7 @@ async function runTurn(res, { name, model, buildPrompt, memoryTurn }) {
       );
       if (!reply && text) reply = text;
       okDone = true;
-      sseSend(res, { type: 'done', ms: Date.now() - started, cost, toolsSeen, used });
+      sseSend(res, { type: 'done', ms: Date.now() - started, cost, toolsSeen, used, autoFeishu });
     }
   } catch (e) {
     sseSend(res, { type: 'error', message: String(e.message || e) });
@@ -150,6 +152,7 @@ app.post('/api/review', async (req, res) => {
   persistIfDraft(docType, name, markdown);
   await runTurn(res, {
     name, model,
+    scanText: markdown,   // 扫整篇草稿正文里裸贴的飞书链接
     buildPrompt: (ctx) => reviewPrompt(name, markdown, quick, ctx) + (isDim(docType) ? L3_NOTE : ''),
     memoryTurn: { label: quick ? '快速核查' : '批改', masterText: '' },
   });
@@ -168,6 +171,8 @@ app.post('/api/act', async (req, res) => {
   const ACT_ZH = { ask: '选段提问', supplement: '补充', revise: '修正', question: '提问', draft: '起草', audit: '审对不对' };
   await runTurn(res, {
     name, model,
+    // 扫正文 + 选段 + 提问/大纲里裸贴的飞书链接（选段多为正文子串，dedup 会去重）
+    scanText: [markdown, selection, question, outline].filter(Boolean).join('\n'),
     buildPrompt: (ctx) => actPrompt(action, { name, selection, question, outline, md: markdown }, ctx) + (isDim(docType) ? L3_NOTE : ''),
     memoryTurn: { label: ACT_ZH[action] || action, masterText: [question, outline].filter(Boolean).join('\n') },
   });

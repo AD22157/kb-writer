@@ -17,9 +17,9 @@ import path from 'node:path';
 //   · 清 env：kb-writer 若带 OPENCLAW_* 会打死 lark-cli 的用户身份（回退/拒用个人身份，静默读不到）。
 //     spawn 前清掉整族 OPENCLAW_* + 还原被 openclaw 改过的 TMPDIR。见记忆 ref_openclaw_cron_env_lark。
 //
-// TODO(model-agnostic 上下文层内联)：真正治本、让 opus/fable/deepseek-批改/补写 都受益的做法，是在
-//   contextAssembler 装配上下文时就把草稿/选段里的飞书链接内联成快照（那样连"无工具的直连补全"路径也能读到）。
-//   但那要动 contextAssembler.mjs/server.mjs（本次由并行 agent 在改），本次先不做，只把 DeepSeek 工具循环这条修透。
+// model-agnostic 上下文层内联（已落地）：contextAssembler 装配上下文时就扫草稿正文/选段里的飞书链接、
+//   调本模块 feishuRead 内联成快照（连"无工具的直连补全"deepseek 路径也能读到）。见 contextAssembler.mjs 的
+//   scanAutoFeishu/assembleContext；本模块另导出 classifyFeishuUrl 给它判类型（note-only 与否）。
 
 const LARK_BIN = process.env.KB_WRITER_LARK_BIN || 'lark-cli';
 
@@ -105,10 +105,11 @@ function parseFeishuUrl(raw) {
   if (!hostOk(u.hostname)) return { error: `拒绝：${u.hostname} 不是飞书域名（只允许 *.feishu.cn / *.larksuite.com）` };
   const segs = u.pathname.split('/').filter(Boolean);
   // 找 "<kind>/<token>" 形态
+  // 注：query（?from=copylink…）与 #anchor 天然不进 u.pathname，故各类"复制链接"形态都能认。
   const KIND = {
     folder: 'folder', docx: 'docx', docs: 'doc', doc: 'doc', wiki: 'wiki',
     sheets: 'sheet', sheet: 'sheet', base: 'base', bitable: 'base', slides: 'slides',
-    file: 'file', minutes: 'minutes',
+    file: 'file', minutes: 'minutes', mindnote: 'docx',
   };
   for (let i = segs.length - 2; i >= 0; i--) {
     const kind = KIND[segs[i]];
@@ -240,6 +241,19 @@ async function readFolder(rootToken, { maxDocs, maxCharsPerDoc, totalBudget, max
     (unread > 0 ? `还有 ${unread} 篇可读文档未展开——要读某一篇的全文，用清单里它后面的链接单独再调 feishu_read（每项后的 URL 就是可直接读的链接）。` : '') +
     (signal?.aborted || Date.now() > deadline ? '（注意：因时间预算，读取提前结束，可能未覆盖全部。）' : '');
   return `${header}\n\n── 目录清单（可读项后附其飞书链接，可对某项单独 feishu_read）──\n${listBlock}${listMore}\n\n── 已读内容 ──\n${read.join('\n\n') || '（本文件夹下没有可全文读的 docx/wiki/表格）'}`;
+}
+
+// 轻量分类（不出网、不 spawn）：给上下文装配器判正文里飞书链接的类型/是否 note-only/是否可识别。
+// 返回 { type, token, typeCn, noteOnly } 或 { error }。
+export function classifyFeishuUrl(url) {
+  const parsed = parseFeishuUrl(url);
+  if (parsed.error) return { error: parsed.error };
+  return {
+    type: parsed.type,
+    token: parsed.token,
+    typeCn: TYPE_CN[parsed.type] || parsed.type,
+    noteOnly: NOTE_ONLY.has(parsed.type),
+  };
 }
 
 // ---- 对外入口：feishu_read({url, max_docs, max_chars}, signal) → string ----

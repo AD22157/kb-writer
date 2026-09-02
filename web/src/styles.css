@@ -67,6 +67,12 @@ select, input { font: inherit; padding: 4px 7px; border: 1px solid var(--line); 
 .chip { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 10px; background: var(--line); color: var(--ink); margin: 0 3px 3px 0; }
 .chip.live { background: var(--live); color: #fff; } .chip.snapshot { background: var(--snap); color: #fff; }
 .chip.tool { background: var(--accent2); color: #fff; }
+.chip.autofeishu { background: #2f7d5b; color: #fff; } .chip.autofail { background: var(--warn); color: #fff; }
+.feishu-auto { line-height: 1.6; }
+.feishu-auto .muted { color: var(--muted); }
+.feishu-fail { color: var(--warn); font-weight: 600; }
+.feishu-fail-line { color: var(--warn); font-size: 12px; margin-top: 2px; word-break: break-all; }
+.feishu-note-line { font-size: 12px; margin-top: 2px; word-break: break-all; }
 .status { font-size: 12.5px; color: var(--muted); margin: 4px 0; }
 .errbanner { margin: 8px 0; padding: 10px 12px; border-radius: 8px; background: rgba(192,57,43,.12); border: 1px solid var(--warn); color: var(--warn); font-size: 13.5px; line-height: 1.5; }
 

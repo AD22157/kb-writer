@@ -29,13 +29,17 @@ export async function api(path: string, opts: RequestInit = {}) {
 }
 
 export type SseEvent =
-  | { type: 'context'; used: UsedSource[]; kind: string }
+  | { type: 'context'; used: UsedSource[]; kind: string; autoFeishu?: AutoFeishu }
   | { type: 'delta'; text: string }
   | { type: 'tool'; name: string }
-  | { type: 'done'; ms: number; cost: number; toolsSeen: string[]; used: UsedSource[] }
+  | { type: 'done'; ms: number; cost: number; toolsSeen: string[]; used: UsedSource[]; autoFeishu?: AutoFeishu }
   | { type: 'error'; message: string };
 
 export interface UsedSource { id: string; label: string; mode: string; type: string; skill?: string }
+
+// 正文里"裸贴"的飞书链接被自动识别/读取的战报（后端 assembleContext 给出，前端可见化）
+export interface AutoFeishuLink { url: string; status: 'read' | 'cached' | 'note-only' | 'failed' | 'mounted' | 'limit'; reason?: string; type?: string }
+export interface AutoFeishu { found: number; read: number; cached: number; failed: number; skipped: number; links: AutoFeishuLink[] }
 
 // 打开一个 SSE 流，逐事件回调。返回一个取消函数。
 export async function sse(path: string, body: any, onEvent: (e: SseEvent) => void): Promise<void> {
